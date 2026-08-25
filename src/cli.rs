@@ -51,6 +51,30 @@ pub struct RecordArgs {
     /// `list-sources`). Not implemented yet -- same status as --monitor.
     #[arg(long)]
     pub window: Option<u64>,
+
+    /// What audio, if any, to capture alongside the video.
+    #[arg(long, value_enum, default_value = "none")]
+    pub audio: AudioMode,
+
+    /// Override the PulseAudio device used for --audio=mic or
+    /// --audio=system (see `pactl list sources short` for names).
+    /// Not supported with --audio=both, which always uses the default
+    /// mic and the default sink's monitor.
+    #[arg(long)]
+    pub audio_device: Option<String>,
+}
+
+/// What audio, if any, to capture alongside the video.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioMode {
+    /// Video only (default) -- matches milestones 1/2's behavior.
+    None,
+    /// The default microphone / input source.
+    Mic,
+    /// Desktop/system audio, via the default sink's PulseAudio monitor.
+    System,
+    /// Mic and system audio mixed together.
+    Both,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]

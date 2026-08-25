@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
-use crate::cli::Container;
+use crate::audio;
+use crate::cli::{AudioMode, Container};
 use crate::source::CaptureSource;
 
 /// Fully resolved settings needed to build a recording pipeline.
@@ -14,15 +15,19 @@ pub struct RecordConfig {
     pub bitrate_kbps: u32,
     pub speed_preset: String,
     pub container: Container,
+    pub audio_mode: AudioMode,
+    pub audio_device: Option<String>,
 }
 
 /// Builds (but does not start) a GStreamer pipeline that captures
-/// `source` and encodes/muxes it to `cfg.output_path`.
+/// `source` (and, per `cfg.audio_mode`, an audio branch) and
+/// encodes/muxes it to `cfg.output_path`.
 ///
 /// This is the only place that knows the concrete element chain
 /// (capture source -> videoconvert -> x264enc -> h264parse -> mux ->
-/// filesink); `record.rs` just drives whatever `gst::Pipeline` comes
-/// back through Playing/EOS/Null without caring how it was assembled.
+/// filesink, plus whatever `audio.rs` adds alongside it); `record.rs`
+/// just drives whatever `gst::Pipeline` comes back through
+/// Playing/EOS/Null without caring how it was assembled.
 pub fn build_recording_pipeline(source: &CaptureSource, cfg: &RecordConfig) -> Result<gst::Pipeline> {
     let pipeline = gst::Pipeline::with_name("desktoprecorder-pipeline");
 
@@ -89,6 +94,19 @@ pub fn build_recording_pipeline(source: &CaptureSource, cfg: &RecordConfig) -> R
         .context("failed to add elements to pipeline")?;
     gst::Element::link_many([&src, &capsfilter, &convert, &encoder, &parse, &mux, &sink])
         .context("failed to link pipeline elements")?;
+
+    // audio.rs adds its own elements to `pipeline` directly (elements
+    // must belong to the pipeline before they're linked -- see the
+    // comment on `build_audio_branch`), then hands back just the tail
+    // to link into the muxer's next available (audio) pad, the same way
+    // `parse` above claimed the video pad -- muxers like matroskamux
+    // and qtmux hand out a compatible request pad per `link()` call.
+    if let Some(audio_branch) = audio::build_audio_branch(&pipeline, cfg.audio_mode, cfg.audio_device.as_deref())? {
+        audio_branch
+            .tail
+            .link(&mux)
+            .context("failed to link audio branch into muxer")?;
+    }
 
     Ok(pipeline)
 }

@@ -1,3 +1,4 @@
+mod audio;
 mod cli;
 mod error;
 mod pipeline;
@@ -12,7 +13,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use gstreamer as gst;
 
-use cli::{Cli, Command, Container, RecordArgs};
+use cli::{AudioMode, Cli, Command, Container, RecordArgs};
 use error::RecorderError;
 use pipeline::RecordConfig;
 use source::{CaptureSource, X11ScreenConfig};
@@ -56,6 +57,8 @@ fn record_command(args: RecordArgs) -> Result<()> {
         bitrate_kbps: args.bitrate,
         speed_preset: args.speed_preset,
         container,
+        audio_mode: args.audio,
+        audio_device: args.audio_device.clone(),
     };
 
     let pipeline = pipeline::build_recording_pipeline(&source, &cfg)?;
@@ -69,13 +72,20 @@ fn record_command(args: RecordArgs) -> Result<()> {
         .context("failed to install Ctrl+C/SIGTERM handler")?;
     }
 
+    let audio_desc = match args.audio {
+        AudioMode::None => "no audio",
+        AudioMode::Mic => "mic audio",
+        AudioMode::System => "system audio",
+        AudioMode::Both => "mic+system audio",
+    };
     println!(
-        "recording to {} for {} ({}fps, {}kbps, {})... press Ctrl+C to stop early",
+        "recording to {} for {} ({}fps, {}kbps, {}, {})... press Ctrl+C to stop early",
         args.output.display(),
         args.duration,
         args.framerate,
         args.bitrate,
         container.mux_element_name(),
+        audio_desc,
     );
 
     record::run_recording(&pipeline, *args.duration, &stop_requested)?;
