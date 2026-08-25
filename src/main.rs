@@ -1,5 +1,6 @@
 mod audio;
 mod cli;
+mod gui;
 mod pipeline;
 mod record;
 mod source;
@@ -35,6 +36,7 @@ fn run() -> Result<()> {
     match cli.command {
         Command::Record(args) => record_command(args),
         Command::ListSources => list_sources_command(),
+        Command::Gui => gui::run(),
     }
 }
 

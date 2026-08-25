@@ -15,6 +15,8 @@ pub enum Command {
     Record(RecordArgs),
     /// List available capture sources (monitors/windows).
     ListSources,
+    /// Launch the graphical interface.
+    Gui,
 }
 
 #[derive(Args, Debug)]

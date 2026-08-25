@@ -7,7 +7,8 @@ edition = "2024"
 gstreamer = "0.25"
 clap = { version = "4.6", features = ["derive"] }
 anyhow = "1.0"
-thiserror = "2.0"
 humantime = "2.4"
 ctrlc = { version = "3.5", features = ["termination"] }
 x11rb = { version = "0.14.0", features = ["randr"] }
+gtk4 = { version = "0.11", features = ["v4_18"] }
+libadwaita = { version = "0.9", features = ["v1_7", "gtk_v4_18"] }
