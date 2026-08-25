@@ -29,12 +29,35 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     gst::init().context("failed to initialize GStreamer")?;
+    check_not_wayland()?;
 
     let cli = Cli::parse();
     match cli.command {
         Command::Record(args) => record_command(args),
         Command::ListSources => list_sources_command(),
     }
+}
+
+/// This tool captures via X11 directly (`ximagesrc`, and `x11_query`'s
+/// RandR/EWMH queries), not through `xdg-desktop-portal`/PipeWire, so it
+/// doesn't work under Wayland. Worth checking for up front and failing
+/// clearly: even when XWayland makes an X11 connection available (the
+/// common case -- most Wayland sessions start it automatically for X11
+/// app compatibility), `list-sources` could appear to work off stale/
+/// misleading data, and actually recording would silently produce a
+/// black or frozen file rather than a clear error, since Wayland
+/// compositors block XShm-based screen reads off the X11 root window
+/// for security. A `CaptureSource::Portal` variant (see source.rs) is
+/// the real fix, and isn't built yet.
+fn check_not_wayland() -> Result<()> {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        anyhow::bail!(
+            "this looks like a Wayland session (WAYLAND_DISPLAY is set) -- desktoprecorder only supports X11 for now.\n\
+             Screen capture on Wayland needs xdg-desktop-portal + PipeWire, which isn't implemented yet.\n\
+             If you're actually running under X11 and WAYLAND_DISPLAY is just left over from something else, unset it and try again."
+        );
+    }
+    Ok(())
 }
 
 fn record_command(args: RecordArgs) -> Result<()> {
