@@ -5,6 +5,8 @@ mod record;
 mod source;
 
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -58,8 +60,17 @@ fn record_command(args: RecordArgs) -> Result<()> {
 
     let pipeline = pipeline::build_recording_pipeline(&source, &cfg)?;
 
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    {
+        let stop_requested = Arc::clone(&stop_requested);
+        ctrlc::set_handler(move || {
+            stop_requested.store(true, Ordering::SeqCst);
+        })
+        .context("failed to install Ctrl+C/SIGTERM handler")?;
+    }
+
     println!(
-        "recording to {} for {} ({}fps, {}kbps, {})...",
+        "recording to {} for {} ({}fps, {}kbps, {})... press Ctrl+C to stop early",
         args.output.display(),
         args.duration,
         args.framerate,
@@ -67,9 +78,13 @@ fn record_command(args: RecordArgs) -> Result<()> {
         container.mux_element_name(),
     );
 
-    record::run_recording(&pipeline, *args.duration)?;
+    record::run_recording(&pipeline, *args.duration, &stop_requested)?;
 
-    println!("done: {}", args.output.display());
+    if stop_requested.load(Ordering::SeqCst) {
+        println!("stopped early: {}", args.output.display());
+    } else {
+        println!("done: {}", args.output.display());
+    }
     Ok(())
 }
 

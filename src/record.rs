@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -7,15 +9,11 @@ use gstreamer::prelude::*;
 const POLL_SLICE: Duration = Duration::from_millis(200);
 const EOS_TIMEOUT_SECS: u64 = 10;
 
-/// Runs `pipeline` until `duration` elapses, then cleanly finalizes the
-/// recording so the output file isn't left truncated/corrupt.
-///
-/// Duration expiry is this milestone's only stop trigger; a later
-/// milestone adds Ctrl+C/SIGTERM as an additional `break` condition in
-/// this same loop, feeding the same `finalize()` call below -- so this
-/// function's shape is deliberately left ready for that without needing
-/// a rewrite.
-pub fn run_recording(pipeline: &gst::Pipeline, duration: Duration) -> Result<()> {
+/// Runs `pipeline` until `duration` elapses or `stop_requested` is set
+/// (by a Ctrl+C/SIGTERM handler -- see `main.rs`), then cleanly
+/// finalizes the recording so the output file isn't left
+/// truncated/corrupt either way.
+pub fn run_recording(pipeline: &gst::Pipeline, duration: Duration, stop_requested: &Arc<AtomicBool>) -> Result<()> {
     pipeline
         .set_state(gst::State::Playing)
         .context("failed to start pipeline (Playing)")?;
@@ -24,6 +22,9 @@ pub fn run_recording(pipeline: &gst::Pipeline, duration: Duration) -> Result<()>
     let deadline = Instant::now() + duration;
 
     loop {
+        if stop_requested.load(Ordering::SeqCst) {
+            break;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
