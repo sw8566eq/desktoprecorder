@@ -43,13 +43,15 @@ pub struct RecordArgs {
     pub container: Option<Container>,
 
     /// Capture a specific monitor by index instead of the full virtual
-    /// screen. Not implemented yet -- reserved for a later milestone.
+    /// screen (see `list-sources`). Can't be combined with --window.
     #[arg(long)]
     pub monitor: Option<u32>,
 
-    /// Capture a specific window by its X11 window ID (see
-    /// `list-sources`). Not implemented yet -- same status as --monitor.
-    #[arg(long)]
+    /// Capture a specific window by its X11 window ID instead of the
+    /// full virtual screen, e.g. "0x2c00003" as printed by
+    /// `list-sources` (plain decimal also accepted). Can't be combined
+    /// with --monitor.
+    #[arg(long, value_parser = parse_window_id)]
     pub window: Option<u64>,
 
     /// What audio, if any, to capture alongside the video.
@@ -62,6 +64,21 @@ pub struct RecordArgs {
     /// mic and the default sink's monitor.
     #[arg(long)]
     pub audio_device: Option<String>,
+}
+
+/// Parses a `--window` value as hex (with an optional "0x"/"0X" prefix,
+/// matching how `list-sources` prints window IDs -- and how `xwininfo`/
+/// `wmctrl` conventionally print them) or, failing that, as plain
+/// decimal.
+fn parse_window_id(s: &str) -> Result<u64, String> {
+    let err = || format!("invalid window id '{s}' (expected e.g. \"0x2c00003\" or a decimal number)");
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        // Only treat it as hex if "0x"/"0X" was actually present --
+        // otherwise a plain decimal id like "20" would silently be
+        // misread as hex (0x20 = 32).
+        Some(hex) => u64::from_str_radix(hex, 16).map_err(|_| err()),
+        None => s.parse::<u64>().map_err(|_| err()),
+    }
 }
 
 /// What audio, if any, to capture alongside the video.
