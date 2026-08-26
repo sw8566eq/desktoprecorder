@@ -2,6 +2,8 @@
 
 A screen recorder for Linux (X11), written in Rust on top of GStreamer. CLI and GTK4/libadwaita GUI, sharing the same recording engine.
 
+![desktoprecorder GUI](screenshot.png)
+
 ## Features
 
 - Full-screen, per-monitor, or per-window capture (`--monitor`/`--window`, or pick from a dropdown in the GUI)
