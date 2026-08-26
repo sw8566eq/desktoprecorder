@@ -30,6 +30,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::cli::{AudioMode, Container};
+use crate::hotkey;
 use crate::pipeline::{self, RecordConfig};
 use crate::record;
 use crate::source::{CaptureSource, Region, X11ScreenConfig};
@@ -37,6 +38,31 @@ use crate::x11_query;
 
 const AUDIO_MODES: [AudioMode; 4] = [AudioMode::None, AudioMode::Mic, AudioMode::System, AudioMode::Both];
 const AUDIO_LABELS: [&str; 4] = ["No audio", "Microphone", "System audio", "Mic + System audio"];
+
+/// x264enc's speed-preset values, in the same fastest-to-slowest order
+/// x264 itself documents them. Matches the CLI's `--speed-preset`
+/// (cli.rs), which takes this as a free-text string rather than a
+/// clap-validated enum -- kept as one here too rather than introducing a
+/// separate GUI-only enum for it.
+const PRESETS: [&str; 10] = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"];
+/// Index into `PRESETS` matching the CLI's own default (cli.rs).
+const DEFAULT_PRESET_INDEX: u32 = 2;
+/// Same order/length as `PRESETS` -- shown as a per-row tooltip in the
+/// preset dropdown's popup (see `build_preset_dropdown`), since the
+/// bare x264 preset names don't say anything about the speed/CPU-load
+/// tradeoff they stand for.
+const PRESET_DESCRIPTIONS: [&str; 10] = [
+    "Fastest encoding, least CPU -- needs the most bitrate for a given quality.",
+    "Very fast; only slightly better compression than ultrafast.",
+    "Default. Fast enough to keep up with live screen capture without dropping frames.",
+    "A little slower than veryfast for a little better compression.",
+    "Noticeably more CPU than faster for fairly modest compression gains.",
+    "x264's own default balance of speed and compression -- may drop frames on a busy screen.",
+    "Better compression, higher CPU load -- real-time capture may start dropping frames.",
+    "High CPU load -- real-time capture is likely to drop frames.",
+    "Very high CPU load -- not recommended for live capture.",
+    "Extremely slow for negligible gains over veryslow -- effectively unusable live.",
+];
 
 /// `record::run_recording` always needs a concrete deadline -- there's
 /// no real "unbounded" mode in it, and this milestone doesn't touch it.
@@ -81,6 +107,10 @@ struct LatestFrame {
 struct Gui {
     source_dd: gtk4::DropDown,
     audio_dd: gtk4::DropDown,
+    audio_device_entry: gtk4::Entry,
+    framerate_spin: gtk4::SpinButton,
+    bitrate_spin: gtk4::SpinButton,
+    preset_dd: gtk4::DropDown,
     output_entry: gtk4::Entry,
     duration_entry: gtk4::Entry,
     record_btn: gtk4::Button,
@@ -152,8 +182,15 @@ pub fn run() -> anyhow::Result<()> {
         .context("failed to install Ctrl+C/SIGTERM handler")?;
     }
 
+    // Set by hotkey.rs's background X11-listener thread on a matching
+    // key press, cleared by schedule_hotkey_tick once handled -- the
+    // listener thread can never call start_recording or touch
+    // stop_requested directly, since both involve !Send GTK state.
+    let hotkey_pressed = Arc::new(AtomicBool::new(false));
+    hotkey::spawn_listener(Arc::clone(&hotkey_pressed));
+
     let app = adw::Application::builder().application_id("com.desktoprecorder.Gui").build();
-    app.connect_activate(move |app| build_ui(app, Arc::clone(&active_stop)));
+    app.connect_activate(move |app| build_ui(app, Arc::clone(&active_stop), Arc::clone(&hotkey_pressed)));
 
     // Bypass std::env::args() here -- clap already consumed argv (it
     // contains e.g. "desktoprecorder gui"), and GApplication's own
@@ -166,7 +203,7 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_ui(app: &adw::Application, active_stop: Arc<Mutex<Option<Arc<AtomicBool>>>>) {
+fn build_ui(app: &adw::Application, active_stop: Arc<Mutex<Option<Arc<AtomicBool>>>>, hotkey_pressed: Arc<AtomicBool>) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Desktop Recorder")
@@ -184,6 +221,33 @@ fn build_ui(app: &adw::Application, active_stop: Arc<Mutex<Option<Arc<AtomicBool
 
     let audio_dd = gtk4::DropDown::from_strings(&AUDIO_LABELS);
     audio_dd.set_hexpand(true);
+
+    let audio_device_entry =
+        gtk4::Entry::builder().hexpand(true).placeholder_text("Default device (see `pactl list sources short`) -- ignored for Mic + System").build();
+    audio_device_entry.set_tooltip_text(Some(
+        "Overrides the default PulseAudio device for Microphone or System audio (see `pactl list sources short` for names). \
+         Not used with Mic + System, which always mixes the default mic with the default sink's monitor. Matches --audio-device on the CLI.",
+    ));
+
+    let framerate_spin = gtk4::SpinButton::with_range(1.0, 240.0, 1.0);
+    framerate_spin.set_digits(0);
+    framerate_spin.set_value(30.0);
+    framerate_spin.set_hexpand(true);
+    framerate_spin.set_tooltip_text(Some("Frames per second to capture and encode. Matches --framerate on the CLI (default 30)."));
+
+    let bitrate_spin = gtk4::SpinButton::with_range(500.0, 50_000.0, 100.0);
+    bitrate_spin.set_digits(0);
+    bitrate_spin.set_value(8000.0);
+    bitrate_spin.set_hexpand(true);
+    bitrate_spin.set_tooltip_text(Some(
+        "Target video bitrate in kbps -- higher means better quality at a larger file size. Matches --bitrate on the CLI (default 8000).",
+    ));
+
+    let preset_dd = build_preset_dropdown();
+    preset_dd.set_tooltip_text(Some(
+        "x264 encoding speed vs. compression efficiency, fastest to slowest -- open the menu for what each option trades off. \
+         Matches --speed-preset on the CLI (default veryfast).",
+    ));
 
     let output_entry = gtk4::Entry::builder().hexpand(true).placeholder_text("/path/to/recording.mkv").build();
     let browse_btn = gtk4::Button::with_label("Browse…");
@@ -219,6 +283,10 @@ fn build_ui(app: &adw::Application, active_stop: Arc<Mutex<Option<Arc<AtomicBool
     form.append(&preview);
     form.append(&labeled_row("Source:", &source_dd));
     form.append(&labeled_row("Audio:", &audio_dd));
+    form.append(&labeled_row("Audio device:", &audio_device_entry));
+    form.append(&labeled_row("Framerate:", &framerate_spin));
+    form.append(&labeled_row("Bitrate (kbps):", &bitrate_spin));
+    form.append(&labeled_row("Preset:", &preset_dd));
 
     let output_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     let output_label = gtk4::Label::new(Some("Output:"));
@@ -248,6 +316,10 @@ fn build_ui(app: &adw::Application, active_stop: Arc<Mutex<Option<Arc<AtomicBool
     let state = Rc::new(RefCell::new(Gui {
         source_dd: source_dd.clone(),
         audio_dd: audio_dd.clone(),
+        audio_device_entry: audio_device_entry.clone(),
+        framerate_spin: framerate_spin.clone(),
+        bitrate_spin: bitrate_spin.clone(),
+        preset_dd: preset_dd.clone(),
         output_entry: output_entry.clone(),
         duration_entry: duration_entry.clone(),
         record_btn: record_btn.clone(),
@@ -325,7 +397,46 @@ fn build_ui(app: &adw::Application, active_stop: Arc<Mutex<Option<Arc<AtomicBool
 
     start_standalone_preview(&mut state.borrow_mut());
     schedule_preview_tick(Rc::clone(&state));
+    schedule_hotkey_tick(Rc::clone(&state), hotkey_pressed);
     window.present();
+}
+
+/// Builds the Preset dropdown with the CLI's default pre-selected and a
+/// per-row tooltip (see `PRESET_DESCRIPTIONS`) -- `DropDown::from_strings`
+/// alone has no way to attach one, so this replaces its default popup
+/// factory with a custom one that's identical (a plain, left-aligned
+/// label) except for the added `set_tooltip_text`. `list_factory` only
+/// affects the open popup's rows; the closed button's own display
+/// (built from `from_strings`'s default factory) is left untouched.
+fn build_preset_dropdown() -> gtk4::DropDown {
+    let preset_dd = gtk4::DropDown::from_strings(&PRESETS);
+    preset_dd.set_selected(DEFAULT_PRESET_INDEX);
+    preset_dd.set_hexpand(true);
+
+    let factory = gtk4::SignalListItemFactory::new();
+    factory.connect_setup(|_, list_item| {
+        let Some(list_item) = list_item.downcast_ref::<gtk4::ListItem>() else { return };
+        let label = gtk4::Label::new(None);
+        label.set_xalign(0.0);
+        label.set_margin_start(6);
+        label.set_margin_end(6);
+        label.set_margin_top(4);
+        label.set_margin_bottom(4);
+        list_item.set_child(Some(&label));
+    });
+    factory.connect_bind(|_, list_item| {
+        let Some(list_item) = list_item.downcast_ref::<gtk4::ListItem>() else { return };
+        let Some(label) = list_item.child().and_downcast::<gtk4::Label>() else { return };
+        // The popup lists rows in the same order PRESETS/PRESET_DESCRIPTIONS
+        // were given to from_strings/built in, so position doubles as the
+        // index into both -- no need to read the row's item back out.
+        let i = list_item.position() as usize;
+        label.set_label(PRESETS.get(i).copied().unwrap_or_default());
+        label.set_tooltip_text(PRESET_DESCRIPTIONS.get(i).copied());
+    });
+    preset_dd.set_list_factory(Some(&factory));
+
+    preset_dd
 }
 
 fn labeled_row(label: &str, control: &impl IsA<gtk4::Widget>) -> gtk4::Box {
@@ -530,14 +641,26 @@ fn start_recording(state: &Rc<RefCell<Gui>>) {
         let audio_mode = AUDIO_MODES[gui.audio_dd.selected() as usize];
         let container = Container::infer_from_path(&output_path);
 
+        let audio_device_text = gui.audio_device_entry.text();
+        let audio_device = if audio_device_text.trim().is_empty() { None } else { Some(audio_device_text.to_string()) };
+        // Mirrors audio.rs's own hard error for this combination -- worth
+        // catching here too so it's a toast, not a failed-recording
+        // round-trip through the background thread.
+        if audio_mode == AudioMode::Both && audio_device.is_some() {
+            gui.toasts.add_toast(adw::Toast::new(
+                "Audio device can't be set for Mic + System audio (it always mixes the default mic with the default sink's monitor)",
+            ));
+            return;
+        }
+
         let cfg = RecordConfig {
             output_path,
-            framerate: 30,
-            bitrate_kbps: 8000,
-            speed_preset: "veryfast".to_string(),
+            framerate: gui.framerate_spin.value() as u32,
+            bitrate_kbps: gui.bitrate_spin.value() as u32,
+            speed_preset: PRESETS[gui.preset_dd.selected() as usize].to_string(),
             container,
             audio_mode,
-            audio_device: None,
+            audio_device,
         };
 
         (source, cfg, duration, indefinite)
@@ -600,6 +723,31 @@ fn schedule_preview_tick(state: Rc<RefCell<Gui>>) {
             && let Some(frame) = latest.lock().unwrap().take()
         {
             show_frame(&gui.preview, frame);
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Runs forever, independently of `schedule_preview_tick` -- kept on its
+/// own faster timer rather than piggybacking on that one, so hotkey
+/// responsiveness isn't coupled to the preview's cadence. A press toggles
+/// start/stop, mirroring what Record/Stop do respectively. Only the stop
+/// half could be done directly from hotkey.rs's listener thread (it's
+/// just an `Arc<AtomicBool>::store`, same as the Ctrl+C handler above) --
+/// starting needs `start_recording`, which touches `!Send` GTK widgets
+/// and so can only ever run on this thread, hence routing both through
+/// the same poll for symmetry.
+fn schedule_hotkey_tick(state: Rc<RefCell<Gui>>, hotkey_pressed: Arc<AtomicBool>) {
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        if hotkey_pressed.swap(false, Ordering::SeqCst) {
+            let recording = state.borrow().recording;
+            if recording {
+                if let Some(flag) = &state.borrow().stop_requested {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            } else {
+                start_recording(&state);
+            }
         }
         glib::ControlFlow::Continue
     });
@@ -674,6 +822,10 @@ fn set_controls_for_recording(gui: &Gui, recording: bool) {
     gui.stop_btn.set_sensitive(recording);
     gui.source_dd.set_sensitive(!recording);
     gui.audio_dd.set_sensitive(!recording);
+    gui.audio_device_entry.set_sensitive(!recording);
+    gui.framerate_spin.set_sensitive(!recording);
+    gui.bitrate_spin.set_sensitive(!recording);
+    gui.preset_dd.set_sensitive(!recording);
     gui.output_entry.set_sensitive(!recording);
     gui.duration_entry.set_sensitive(!recording);
 }

@@ -1,6 +1,7 @@
 mod audio;
 mod cli;
 mod gui;
+mod hotkey;
 mod pipeline;
 mod record;
 mod source;

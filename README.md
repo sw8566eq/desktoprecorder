@@ -7,7 +7,7 @@ A screen recorder for Linux (X11), written in Rust on top of GStreamer. CLI and 
 - Full-screen, per-monitor, or per-window capture (`--monitor`/`--window`, or pick from a dropdown in the GUI)
 - Optional audio: microphone, system audio (via the default sink's PulseAudio monitor), or both mixed together
 - Matroska (`.mkv`) or MP4 output, clean EOS-based shutdown on Ctrl+C/SIGTERM (both CLI and GUI) so files are never left truncated; closing the GUI window mid-recording is refused rather than losing the file
-- GUI: live preview of the selected source (before and during recording), optional duration (blank = record until Stop, capped at 24h), Record/Stop
+- GUI: live preview of the selected source (before and during recording), optional duration (blank = record until Stop, capped at 24h), framerate/bitrate/preset/audio-device controls matching the CLI, Record/Stop, and a global `Ctrl+Alt+R` hotkey to start/stop even when the window isn't focused
 
 ## Requirements
 
