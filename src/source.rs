@@ -44,7 +44,7 @@ impl Default for X11ScreenConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Region {
     pub x: u32,
     pub y: u32,
@@ -85,4 +85,69 @@ fn build_ximagesrc(cfg: &X11ScreenConfig) -> Result<gst::Element> {
     builder
         .build()
         .context("failed to create 'ximagesrc' element (is gstreamer1.0-plugins-good installed?)")
+}
+
+/// `build_element` just constructs and configures a GStreamer element
+/// (`ElementFactory::make(...).build()`) -- it never opens an X11
+/// connection or reads the screen, so these tests run safely with no
+/// display involved, unlike anything that actually starts a pipeline
+/// (see record.rs's tests for that, using a synthetic non-X11 source).
+#[cfg(test)]
+mod tests {
+    use gstreamer::prelude::*;
+
+    use super::*;
+
+    fn init_gst() {
+        gst::init().expect("gst::init should always succeed in a test process");
+    }
+
+    #[test]
+    fn default_config_builds_with_expected_defaults() {
+        init_gst();
+        let elem = CaptureSource::X11Screen(X11ScreenConfig::default()).build_element().unwrap();
+        assert!(!elem.property::<bool>("use-damage"));
+        assert!(elem.property::<bool>("show-pointer"));
+    }
+
+    #[test]
+    fn region_sets_start_end_from_position_and_size() {
+        init_gst();
+        let cfg = X11ScreenConfig {
+            region: Some(Region { x: 100, y: 50, width: 800, height: 600 }),
+            ..X11ScreenConfig::default()
+        };
+        let elem = CaptureSource::X11Screen(cfg).build_element().unwrap();
+        assert_eq!(elem.property::<u32>("startx"), 100);
+        assert_eq!(elem.property::<u32>("starty"), 50);
+        // endx/endy are the region's far corner, not its width/height --
+        // this is exactly the arithmetic a copy-paste typo could get
+        // wrong (e.g. reusing width instead of x + width).
+        assert_eq!(elem.property::<u32>("endx"), 900);
+        assert_eq!(elem.property::<u32>("endy"), 650);
+    }
+
+    #[test]
+    fn xid_is_set_when_present() {
+        init_gst();
+        let cfg = X11ScreenConfig { xid: Some(0x2c00003), ..X11ScreenConfig::default() };
+        let elem = CaptureSource::X11Screen(cfg).build_element().unwrap();
+        assert_eq!(elem.property::<u64>("xid"), 0x2c00003);
+    }
+
+    #[test]
+    fn show_pointer_false_is_respected() {
+        init_gst();
+        let cfg = X11ScreenConfig { show_pointer: false, ..X11ScreenConfig::default() };
+        let elem = CaptureSource::X11Screen(cfg).build_element().unwrap();
+        assert!(!elem.property::<bool>("show-pointer"));
+    }
+
+    #[test]
+    fn display_name_is_set_when_present() {
+        init_gst();
+        let cfg = X11ScreenConfig { display_name: Some(":1".to_string()), ..X11ScreenConfig::default() };
+        let elem = CaptureSource::X11Screen(cfg).build_element().unwrap();
+        assert_eq!(elem.property::<String>("display-name"), ":1");
+    }
 }

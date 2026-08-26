@@ -193,9 +193,17 @@ fn window_class(conn: &RustConnection, xid: Window) -> Result<String> {
         .reply()
         .context("failed to read WM_CLASS reply")?;
 
-    let parts: Vec<&[u8]> = reply.value.split(|&b| b == 0).filter(|s| !s.is_empty()).collect();
-    let class = parts.get(1).or(parts.first()).context("window has no WM_CLASS set")?;
-    Ok(String::from_utf8_lossy(class).into_owned())
+    parse_wm_class(&reply.value).context("window has no WM_CLASS set")
+}
+
+/// Picks the class out of a raw `WM_CLASS` property value ("instance\0class\0",
+/// nul-separated) -- split out from `window_class` so the parsing itself
+/// (as opposed to the property fetch) can be unit tested without an X11
+/// connection.
+fn parse_wm_class(value: &[u8]) -> Option<String> {
+    let parts: Vec<&[u8]> = value.split(|&b| b == 0).filter(|s| !s.is_empty()).collect();
+    let class = parts.get(1).or(parts.first())?;
+    Some(String::from_utf8_lossy(class).into_owned())
 }
 
 fn window_region(conn: &RustConnection, root: Window, xid: Window) -> Result<Region> {
@@ -209,4 +217,64 @@ fn window_region(conn: &RustConnection, root: Window, xid: Window) -> Result<Reg
         .reply()
         .context("failed to read TranslateCoordinates reply")?;
     nonneg(pos.dst_x, pos.dst_y, geom.width, geom.height, &format!("window {xid:#x}"))
+}
+
+/// Tests below cover the pure decode/validation logic factored out above
+/// (`nonneg`, `parse_wm_class`) -- everything else in this module makes a
+/// live X11 round trip and is exercised manually by running the app
+/// (see CLAUDE.md), not here: an automated test that opens its own
+/// connection to a real X session on every `cargo test` run would touch
+/// whatever desktop happens to be at $DISPLAY, which this codebase treats
+/// as something to be deliberate about, not something to do incidentally.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonneg_converts_valid_coordinates() {
+        let region = nonneg(10, 20, 800, 600, "test").unwrap();
+        assert_eq!(region, Region { x: 10, y: 20, width: 800, height: 600 });
+    }
+
+    #[test]
+    fn nonneg_accepts_zero_origin() {
+        let region = nonneg(0, 0, 1920, 1080, "test").unwrap();
+        assert_eq!(region, Region { x: 0, y: 0, width: 1920, height: 1080 });
+    }
+
+    #[test]
+    fn nonneg_rejects_negative_x() {
+        let err = nonneg(-1, 0, 800, 600, "monitor 'left-of-origin'").unwrap_err();
+        assert!(err.to_string().contains("monitor 'left-of-origin'"));
+    }
+
+    #[test]
+    fn nonneg_rejects_negative_y() {
+        assert!(nonneg(0, -1, 800, 600, "test").is_err());
+    }
+
+    #[test]
+    fn parse_wm_class_prefers_second_part() {
+        // "instance\0class\0" -- WM_CLASS's documented shape.
+        assert_eq!(parse_wm_class(b"firefox\0Firefox\0"), Some("Firefox".to_string()));
+    }
+
+    #[test]
+    fn parse_wm_class_falls_back_to_first_part_when_only_one() {
+        assert_eq!(parse_wm_class(b"onlyone\0"), Some("onlyone".to_string()));
+        assert_eq!(parse_wm_class(b"onlyone"), Some("onlyone".to_string()));
+    }
+
+    #[test]
+    fn parse_wm_class_skips_leading_empty_segments() {
+        // A leading nul (empty instance name) shouldn't shift "Firefox"
+        // into the "instance" slot and lose it.
+        assert_eq!(parse_wm_class(b"\0Firefox\0"), Some("Firefox".to_string()));
+    }
+
+    #[test]
+    fn parse_wm_class_none_for_empty_property() {
+        assert_eq!(parse_wm_class(b""), None);
+        assert_eq!(parse_wm_class(b"\0\0"), None);
+    }
 }

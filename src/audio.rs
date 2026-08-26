@@ -11,6 +11,7 @@ use crate::cli::AudioMode;
 /// muxer's next available audio pad, the same way it links the video
 /// branch -- callers never need to know whether it came from a single
 /// `pulsesrc` or two mixed together.
+#[derive(Debug)]
 pub struct AudioBranch {
     pub tail: gst::Element,
 }
@@ -182,4 +183,88 @@ fn default_monitor_device() -> Result<String> {
     }
 
     Ok(format!("{sink}.monitor"))
+}
+
+/// `build_audio_branch` only constructs elements (`ElementFactory::make`)
+/// and links them -- it never sets the pipeline to Playing -- so these
+/// tests don't need a running recording or real audio hardware. `System`
+/// and `Both` do shell out to `pactl get-default-sink` even at this
+/// build-only stage (see `default_monitor_device`), so they depend on
+/// PulseAudio actually running, same as the app itself already requires
+/// (see CLAUDE.md's PulseAudio note) -- not an extra test-only
+/// dependency.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_gst() {
+        gst::init().expect("gst::init should always succeed in a test process");
+    }
+
+    #[test]
+    fn none_mode_adds_nothing() {
+        init_gst();
+        let pipeline = gst::Pipeline::new();
+        let branch = build_audio_branch(&pipeline, AudioMode::None, None).unwrap();
+        assert!(branch.is_none());
+    }
+
+    #[test]
+    fn both_with_device_override_is_rejected_before_touching_pulseaudio() {
+        init_gst();
+        let pipeline = gst::Pipeline::new();
+        // If this accidentally called pactl before bailing, it would
+        // still pass on a machine with PulseAudio running -- the point
+        // of this test is that it passes even without one, since the
+        // bail happens first.
+        let err = build_audio_branch(&pipeline, AudioMode::Both, Some("some-device")).unwrap_err();
+        assert!(err.to_string().contains("--audio=both"));
+    }
+
+    #[test]
+    fn mic_mode_builds_a_capture_chain_ending_in_aacparse() {
+        init_gst();
+        let pipeline = gst::Pipeline::new();
+        let branch = build_audio_branch(&pipeline, AudioMode::Mic, None).unwrap().unwrap();
+        assert_eq!(branch.tail.factory().unwrap().name(), "aacparse");
+    }
+
+    #[test]
+    fn mic_mode_with_device_override_builds() {
+        init_gst();
+        let pipeline = gst::Pipeline::new();
+        // Doesn't need the named device to actually exist -- pulsesrc's
+        // "device" is just a property set at construction, not resolved
+        // until Playing.
+        let branch = build_audio_branch(&pipeline, AudioMode::Mic, Some("nonexistent-device")).unwrap().unwrap();
+        assert_eq!(branch.tail.factory().unwrap().name(), "aacparse");
+    }
+
+    #[test]
+    fn system_mode_builds_via_the_default_sink_monitor() {
+        init_gst();
+        let pipeline = gst::Pipeline::new();
+        let branch = build_audio_branch(&pipeline, AudioMode::System, None).unwrap().unwrap();
+        assert_eq!(branch.tail.factory().unwrap().name(), "aacparse");
+    }
+
+    #[test]
+    fn both_mode_mixes_mic_and_system_into_one_branch() {
+        init_gst();
+        let pipeline = gst::Pipeline::new();
+        let branch = build_audio_branch(&pipeline, AudioMode::Both, None).unwrap().unwrap();
+        assert_eq!(branch.tail.factory().unwrap().name(), "aacparse");
+        // Both mixes two capture chains through an audiomixer -- confirm
+        // it's actually in the pipeline, not just that *some* branch
+        // exists (which Mic alone would also satisfy).
+        assert!(pipeline.children().iter().any(|e| e.factory().is_some_and(|f| f.name() == "audiomixer")));
+    }
+
+    #[test]
+    fn default_monitor_device_appends_dot_monitor() {
+        // Exercises the real `pactl get-default-sink` call -- depends on
+        // PulseAudio running, same as the app does at runtime.
+        let device = default_monitor_device().unwrap();
+        assert!(device.ends_with(".monitor"));
+    }
 }

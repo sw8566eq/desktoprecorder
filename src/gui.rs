@@ -834,3 +834,72 @@ fn format_elapsed(d: Duration) -> String {
     let secs = d.as_secs();
     format!("{:02}:{:02}", secs / 60, secs % 60)
 }
+
+/// Everything below is plain data/logic with no GTK widget or live
+/// display involved, so it's safe to run in the normal `cargo test`
+/// pass. The widgets themselves (signal wiring, layout, tooltip hover)
+/// aren't covered here -- this project has no headless-GTK test harness,
+/// and building one is a separate undertaking from filling in coverage
+/// for what's already testable; that side stays the manual pass
+/// CLAUDE.md already describes.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preset_arrays_stay_in_lockstep() {
+        // PRESETS/PRESET_DESCRIPTIONS/DEFAULT_PRESET_INDEX are three
+        // independently hand-maintained consts with no compiler-enforced
+        // link between them -- this is exactly the kind of thing that
+        // silently desyncs when a future edit adds/removes/reorders one
+        // preset without touching the other array.
+        assert_eq!(PRESETS.len(), PRESET_DESCRIPTIONS.len());
+        assert!((DEFAULT_PRESET_INDEX as usize) < PRESETS.len());
+        // Matches the CLI's own default (cli.rs's --speed-preset).
+        assert_eq!(PRESETS[DEFAULT_PRESET_INDEX as usize], "veryfast");
+    }
+
+    #[test]
+    fn audio_mode_arrays_stay_in_lockstep() {
+        assert_eq!(AUDIO_MODES.len(), AUDIO_LABELS.len());
+        assert_eq!(AUDIO_MODES[0], AudioMode::None);
+    }
+
+    #[test]
+    fn build_capture_source_full_screen_has_no_region_or_xid() {
+        let CaptureSource::X11Screen(cfg) = build_capture_source(SourceChoice::FullScreen);
+        assert!(cfg.region.is_none());
+        assert!(cfg.xid.is_none());
+    }
+
+    #[test]
+    fn build_capture_source_monitor_sets_region_only() {
+        let region = Region { x: 0, y: 0, width: 1920, height: 1080 };
+        let CaptureSource::X11Screen(cfg) = build_capture_source(SourceChoice::Monitor(region));
+        assert_eq!(cfg.region, Some(region));
+        assert!(cfg.xid.is_none());
+    }
+
+    #[test]
+    fn build_capture_source_window_sets_xid_only() {
+        let CaptureSource::X11Screen(cfg) = build_capture_source(SourceChoice::Window(0x2c00003));
+        assert_eq!(cfg.xid, Some(0x2c00003));
+        assert!(cfg.region.is_none());
+    }
+
+    #[test]
+    fn format_elapsed_pads_to_two_digits() {
+        assert_eq!(format_elapsed(Duration::from_secs(0)), "00:00");
+        assert_eq!(format_elapsed(Duration::from_secs(65)), "01:05");
+        assert_eq!(format_elapsed(Duration::from_secs(599)), "09:59");
+    }
+
+    #[test]
+    fn format_elapsed_does_not_wrap_past_59_minutes() {
+        // Minutes just keep growing rather than rolling into an hours
+        // column -- documenting the actual behavior (relevant since
+        // INDEFINITE_DURATION is 24h, i.e. "1440:00" at the cap) rather
+        // than assuming an hh:mm:ss format that isn't what's implemented.
+        assert_eq!(format_elapsed(Duration::from_secs(3661)), "61:01");
+    }
+}

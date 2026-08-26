@@ -125,3 +125,96 @@ impl Container {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn parse_window_id_accepts_hex_with_prefix() {
+        assert_eq!(parse_window_id("0x2c00003").unwrap(), 0x2c00003);
+        assert_eq!(parse_window_id("0X2C00003").unwrap(), 0x2c00003);
+    }
+
+    #[test]
+    fn parse_window_id_accepts_plain_decimal() {
+        // "20" without a 0x/0X prefix must stay decimal (20), not be
+        // misread as hex (which would be 32) -- the exact footgun the
+        // strip_prefix check exists to avoid.
+        assert_eq!(parse_window_id("20").unwrap(), 20);
+        assert_eq!(parse_window_id("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_window_id_rejects_garbage() {
+        assert!(parse_window_id("not-a-window-id").is_err());
+        assert!(parse_window_id("0xzzzz").is_err());
+        assert!(parse_window_id("").is_err());
+    }
+
+    #[test]
+    fn container_inferred_from_extension() {
+        assert_eq!(Container::infer_from_path(Path::new("out.mp4")), Container::Mp4);
+        assert_eq!(Container::infer_from_path(Path::new("out.m4v")), Container::Mp4);
+        assert_eq!(Container::infer_from_path(Path::new("out.mov")), Container::Mp4);
+        // Case-insensitive: the match lowercases the extension first.
+        assert_eq!(Container::infer_from_path(Path::new("out.MP4")), Container::Mp4);
+        assert_eq!(Container::infer_from_path(Path::new("out.mkv")), Container::Mkv);
+    }
+
+    #[test]
+    fn container_defaults_to_mkv_for_unknown_or_missing_extension() {
+        assert_eq!(Container::infer_from_path(Path::new("out.avi")), Container::Mkv);
+        assert_eq!(Container::infer_from_path(Path::new("out")), Container::Mkv);
+    }
+
+    #[test]
+    fn container_mux_element_names() {
+        assert_eq!(Container::Mkv.mux_element_name(), "matroskamux");
+        assert_eq!(Container::Mp4.mux_element_name(), "qtmux");
+    }
+
+    /// `--monitor`/`--window` mutual exclusion is enforced in
+    /// `main.rs::record_command`, not by clap -- confirms clap itself
+    /// still accepts both flags at parse time, i.e. that app-level check
+    /// is load-bearing and not redundant with anything clap already does.
+    #[test]
+    fn clap_allows_monitor_and_window_together() {
+        let cli = Cli::try_parse_from(["desktoprecorder", "record", "-o", "out.mkv", "-d", "10s", "--monitor", "0", "--window", "0x1"]).unwrap();
+        let Command::Record(args) = cli.command else { panic!("expected Record") };
+        assert_eq!(args.monitor, Some(0));
+        assert_eq!(args.window, Some(1));
+    }
+
+    #[test]
+    fn clap_defaults_match_documented_values() {
+        let cli = Cli::try_parse_from(["desktoprecorder", "record", "-o", "out.mkv", "-d", "10s"]).unwrap();
+        let Command::Record(args) = cli.command else { panic!("expected Record") };
+        assert_eq!(args.framerate, 30);
+        assert_eq!(args.bitrate, 8000);
+        assert_eq!(args.speed_preset, "veryfast");
+        assert_eq!(args.audio, AudioMode::None);
+        assert_eq!(args.container, None);
+        assert_eq!(args.audio_device, None);
+    }
+
+    #[test]
+    fn clap_parses_duration_and_window_flag_end_to_end() {
+        let cli = Cli::try_parse_from(["desktoprecorder", "record", "-o", "out.mkv", "-d", "2m30s", "--window", "0x2c00003"]).unwrap();
+        let Command::Record(args) = cli.command else { panic!("expected Record") };
+        assert_eq!(*args.duration, Duration::from_secs(150));
+        assert_eq!(args.window, Some(0x2c00003));
+    }
+
+    #[test]
+    fn clap_rejects_invalid_duration() {
+        assert!(Cli::try_parse_from(["desktoprecorder", "record", "-o", "out.mkv", "-d", "not-a-duration"]).is_err());
+    }
+
+    #[test]
+    fn clap_rejects_missing_required_args() {
+        assert!(Cli::try_parse_from(["desktoprecorder", "record"]).is_err());
+    }
+}

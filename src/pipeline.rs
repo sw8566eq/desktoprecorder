@@ -249,3 +249,91 @@ fn build_recording_pipeline_inner(source: &CaptureSource, cfg: &RecordConfig, pr
 
     Ok(pipeline)
 }
+
+/// These build pipelines but never call `set_state` on them, so nothing
+/// here needs a display, PulseAudio, or the recording to actually run --
+/// `ElementFactory::make(...).build()` and `Element::link()` fail (return
+/// `Err`) immediately if an element or a link is wrong, which is exactly
+/// the class of bug this project has hit before (see the CLAUDE.md
+/// GStreamer lessons: elements added after linking, tee branches missing
+/// their own queue). Running a built pipeline end-to-end is covered
+/// separately, with a synthetic non-X11 source, in record.rs's tests.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::X11ScreenConfig;
+
+    fn init_gst() {
+        gst::init().expect("gst::init should always succeed in a test process");
+    }
+
+    fn base_config(container: Container) -> RecordConfig {
+        RecordConfig {
+            output_path: PathBuf::from("/tmp/desktoprecorder-test-output.bin"),
+            framerate: 30,
+            bitrate_kbps: 8000,
+            speed_preset: "veryfast".to_string(),
+            container,
+            audio_mode: AudioMode::None,
+            audio_device: None,
+        }
+    }
+
+    fn source() -> CaptureSource {
+        CaptureSource::X11Screen(X11ScreenConfig::default())
+    }
+
+    #[test]
+    fn builds_for_mkv_without_audio() {
+        init_gst();
+        build_recording_pipeline(&source(), &base_config(Container::Mkv)).unwrap();
+    }
+
+    #[test]
+    fn builds_for_mp4_without_audio() {
+        init_gst();
+        build_recording_pipeline(&source(), &base_config(Container::Mp4)).unwrap();
+    }
+
+    #[test]
+    fn builds_with_mic_audio_and_links_into_the_muxer() {
+        // Exercises the full audio-branch-to-muxer link, the exact spot
+        // CLAUDE.md's "not-linked" lesson bit this project before --
+        // pulsesrc only needs to be constructed here, not actually
+        // opened (that happens on Playing), so no PulseAudio connection
+        // is needed for this to pass.
+        init_gst();
+        let mut cfg = base_config(Container::Mkv);
+        cfg.audio_mode = AudioMode::Mic;
+        build_recording_pipeline(&source(), &cfg).unwrap();
+    }
+
+    #[test]
+    fn rejects_audio_device_override_with_both_end_to_end() {
+        // audio.rs's Both+device_override validation must actually
+        // surface through the full build_recording_pipeline entry
+        // point, not just when build_audio_branch is called directly.
+        init_gst();
+        let mut cfg = base_config(Container::Mkv);
+        cfg.audio_mode = AudioMode::Both;
+        cfg.audio_device = Some("some-device".to_string());
+        let err = build_recording_pipeline(&source(), &cfg).unwrap_err();
+        assert!(err.to_string().contains("--audio=both"));
+    }
+
+    #[test]
+    fn preview_variant_adds_a_tee_with_named_record_and_preview_queues() {
+        init_gst();
+        let appsink = gst_app::AppSink::builder().build();
+        let pipeline = build_recording_pipeline_with_preview(&source(), &base_config(Container::Mkv), &appsink).unwrap();
+        assert!(pipeline.by_name("record-queue").is_some());
+        assert!(pipeline.by_name("preview-queue").is_some());
+    }
+
+    #[test]
+    fn preview_only_pipeline_builds() {
+        init_gst();
+        let appsink = gst_app::AppSink::builder().build();
+        build_preview_only_pipeline(&source(), &appsink).unwrap();
+    }
+}
