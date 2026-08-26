@@ -112,13 +112,48 @@ struct Gui {
     /// only once actually recording; see `start_recording`/
     /// `finish_recording`). `None` exactly when `recording` is `true`.
     preview_pipeline: Option<gst::Pipeline>,
+    /// Shared with the process-wide Ctrl+C/SIGTERM handler installed in
+    /// `run()` -- kept in sync with `stop_requested` (`Some` with the
+    /// same `Arc` exactly while `recording` is `true`) so the signal
+    /// handler always has a way to reach whichever recording is
+    /// currently active.
+    active_stop: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 
 pub fn run() -> anyhow::Result<()> {
     adw::init().context("failed to initialize libadwaita")?;
 
+    // Unlike the CLI's record_command (main.rs), which installs its own
+    // ctrlc handler scoped to one known Arc<AtomicBool>, the GUI has no
+    // single recording in scope at startup -- it may or may not be
+    // recording at any given moment, and which Arc<AtomicBool> that is
+    // changes across the process's lifetime. This indirection is Some
+    // exactly while a recording is in progress (kept in sync by
+    // start_recording/finish_recording), so the handler -- installed
+    // once here, since ctrlc only allows one process-wide handler --
+    // always has a way to reach whichever recording is currently active.
+    let active_stop: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
+    {
+        let active_stop = Arc::clone(&active_stop);
+        ctrlc::set_handler(move || match active_stop.lock().unwrap().as_ref() {
+            // A recording is running: stop it the same way the Stop
+            // button does. record::run_recording's own poll loop
+            // notices the flag and finalizes normally -- this is what
+            // was missing before (Ctrl+C fell through to the default
+            // SIGINT disposition and killed the process mid-recording,
+            // leaving a truncated file).
+            Some(flag) => flag.store(true, Ordering::SeqCst),
+            // Idle: nothing to finalize, so just exit like a normal
+            // terminal app would. Safe to call directly here --
+            // ctrlc's handler runs on its own dedicated thread, not
+            // actual signal-handler context.
+            None => std::process::exit(0),
+        })
+        .context("failed to install Ctrl+C/SIGTERM handler")?;
+    }
+
     let app = adw::Application::builder().application_id("com.desktoprecorder.Gui").build();
-    app.connect_activate(build_ui);
+    app.connect_activate(move |app| build_ui(app, Arc::clone(&active_stop)));
 
     // Bypass std::env::args() here -- clap already consumed argv (it
     // contains e.g. "desktoprecorder gui"), and GApplication's own
@@ -131,7 +166,7 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_ui(app: &adw::Application) {
+fn build_ui(app: &adw::Application, active_stop: Arc<Mutex<Option<Arc<AtomicBool>>>>) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Desktop Recorder")
@@ -228,6 +263,7 @@ fn build_ui(app: &adw::Application) {
         indefinite: false,
         preview_latest: None,
         preview_pipeline: None,
+        active_stop,
     }));
 
     {
@@ -540,6 +576,7 @@ fn start_recording(state: &Rc<RefCell<Gui>>) {
     {
         let mut gui = state.borrow_mut();
         gui.recording = true;
+        *gui.active_stop.lock().unwrap() = Some(Arc::clone(&stop_requested));
         gui.stop_requested = Some(stop_requested);
         gui.rx = Some(rx);
         gui.started_at = Some(Instant::now());
@@ -602,6 +639,7 @@ fn schedule_tick(state: Rc<RefCell<Gui>>) {
 
 fn finish_recording(gui: &mut Gui, outcome: RecordingOutcome) {
     gui.recording = false;
+    *gui.active_stop.lock().unwrap() = None;
     gui.stop_requested = None;
     gui.rx = None;
     gui.started_at = None;
