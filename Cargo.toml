@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 gstreamer = "0.25"
+gstreamer-app = { version = "0.25", features = ["v1_26"] }
 clap = { version = "4.6", features = ["derive"] }
 anyhow = "1.0"
 humantime = "2.4"
@@ -12,3 +13,11 @@ ctrlc = { version = "3.5", features = ["termination"] }
 x11rb = { version = "0.14.0", features = ["randr"] }
 gtk4 = { version = "0.11", features = ["v4_18"] }
 libadwaita = { version = "0.9", features = ["v1_7", "gtk_v4_18"] }
+
+# This dev environment's disk is chronically near-full (shared across
+# several other projects) -- incremental compilation's on-disk query
+# cache has repeatedly been what tips a build over into "No space left
+# on device" mid-link. Trading slower single-file rebuilds for a
+# meaningfully smaller target/ footprint is the right call here.
+[profile.dev]
+incremental = false

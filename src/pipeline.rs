@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use gstreamer as gst;
 use gstreamer::prelude::*;
+use gstreamer_app as gst_app;
 
 use crate::audio;
 use crate::cli::{AudioMode, Container};
@@ -29,6 +30,89 @@ pub struct RecordConfig {
 /// just drives whatever `gst::Pipeline` comes back through
 /// Playing/EOS/Null without caring how it was assembled.
 pub fn build_recording_pipeline(source: &CaptureSource, cfg: &RecordConfig) -> Result<gst::Pipeline> {
+    build_recording_pipeline_inner(source, cfg, None)
+}
+
+/// GUI-only variant: identical to `build_recording_pipeline`, except the
+/// raw (post-`videoconvert`) video is additionally tee'd into a
+/// downscaled, GTK-friendly branch feeding `preview_sink`. `preview_sink`
+/// must already have its caps/callbacks configured (see gui.rs) -- this
+/// only wires it into the graph.
+pub fn build_recording_pipeline_with_preview(source: &CaptureSource, cfg: &RecordConfig, preview_sink: &gst_app::AppSink) -> Result<gst::Pipeline> {
+    build_recording_pipeline_inner(source, cfg, Some(preview_sink))
+}
+
+/// A lightweight, preview-only pipeline: just `source` downscaled into
+/// `preview_sink`, nothing else -- no encoder/muxer/file. Used by the
+/// GUI so the preview can show live video as soon as a source is picked,
+/// not only once a recording is actually in progress (the recording
+/// pipeline above has its own tee'd-in preview branch for that case).
+/// Unlike a recording pipeline, this has nothing to finalize on
+/// shutdown -- callers can just `set_state(Null)`, no EOS needed.
+pub fn build_preview_only_pipeline(source: &CaptureSource, preview_sink: &gst_app::AppSink) -> Result<gst::Pipeline> {
+    let pipeline = gst::Pipeline::with_name("desktoprecorder-preview-only-pipeline");
+    let src = source.build_element()?;
+
+    // Capped well below recording framerate -- this may run continuously
+    // in the background (e.g. while the user is just browsing source
+    // options), and a live thumbnail has no need to update faster than
+    // this. Still required even at a low rate: ximagesrc's use-damage=false
+    // (source.rs) needs an explicit framerate cap or negotiation is left
+    // to whatever the source defaults to.
+    const PREVIEW_FRAMERATE: i32 = 15;
+    let caps = gst::Caps::builder("video/x-raw").field("framerate", gst::Fraction::new(PREVIEW_FRAMERATE, 1)).build();
+    let capsfilter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &caps)
+        .build()
+        .context("failed to create 'capsfilter' element")?;
+
+    let (preview_scale, preview_capsfilter) = build_preview_scale_chain()?;
+    let preview_elem = preview_sink.upcast_ref::<gst::Element>();
+
+    pipeline
+        .add_many([&src, &capsfilter, &preview_scale, &preview_capsfilter, preview_elem])
+        .context("failed to add elements to preview pipeline")?;
+    gst::Element::link_many([&src, &capsfilter, &preview_scale, &preview_capsfilter, preview_elem])
+        .context("failed to link preview pipeline")?;
+
+    Ok(pipeline)
+}
+
+/// Shared by the recording pipeline's tee'd-in preview branch and the
+/// standalone preview-only pipeline: downscales+color-converts into the
+/// BGRA format gui.rs's appsink consumes. Returns the two elements
+/// already built but not yet added/linked -- callers add them to their
+/// own pipeline and link them into whatever precedes/follows.
+fn build_preview_scale_chain() -> Result<(gst::Element, gst::Element)> {
+    // Does colorspace conversion (to BGRA, chosen to map directly onto
+    // gdk::MemoryFormat::B8g8r8a8 with no further pixel shuffling in
+    // gui.rs) and downscaling together. pixel-aspect-ratio=1/1 is
+    // required alongside width, not optional -- leaving only width
+    // pinned lets negotiation "cheat" by keeping height unchanged and
+    // lying about it via a stretched pixel-aspect-ratio instead of
+    // actually resampling (confirmed with a direct gst-launch-1.0 caps
+    // trace before writing this).
+    let preview_scale = gst::ElementFactory::make("videoconvertscale")
+        .build()
+        .context("failed to create 'videoconvertscale' element (is gstreamer1.0-plugins-base installed?)")?;
+    const PREVIEW_WIDTH: i32 = 480;
+    let preview_caps = gst::Caps::builder("video/x-raw")
+        .field("format", "BGRA")
+        .field("width", PREVIEW_WIDTH)
+        .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+        .build();
+    let preview_capsfilter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &preview_caps)
+        .build()
+        .context("failed to create preview 'capsfilter' element")?;
+    Ok((preview_scale, preview_capsfilter))
+}
+
+/// Shared by both entry points above so the muxer/audio-branch wiring
+/// (and its carefully worded error context) lives in exactly one place --
+/// only the tee-insertion point differs between the CLI's plain path and
+/// the GUI's preview-branching path.
+fn build_recording_pipeline_inner(source: &CaptureSource, cfg: &RecordConfig, preview_sink: Option<&gst_app::AppSink>) -> Result<gst::Pipeline> {
     let pipeline = gst::Pipeline::with_name("desktoprecorder-pipeline");
 
     let src = source.build_element()?;
@@ -89,11 +173,66 @@ pub fn build_recording_pipeline(source: &CaptureSource, cfg: &RecordConfig) -> R
         .build()
         .context("failed to create 'filesink' element")?;
 
-    pipeline
-        .add_many([&src, &capsfilter, &convert, &encoder, &parse, &mux, &sink])
-        .context("failed to add elements to pipeline")?;
-    gst::Element::link_many([&src, &capsfilter, &convert, &encoder, &parse, &mux, &sink])
-        .context("failed to link pipeline elements")?;
+    match preview_sink {
+        None => {
+            pipeline
+                .add_many([&src, &capsfilter, &convert, &encoder, &parse, &mux, &sink])
+                .context("failed to add elements to pipeline")?;
+            gst::Element::link_many([&src, &capsfilter, &convert, &encoder, &parse, &mux, &sink])
+                .context("failed to link pipeline elements")?;
+        }
+        Some(preview_sink) => {
+            // tee's branches need their own queue each -- without one,
+            // a tee's src pads are fed serially by whatever thread is
+            // pushing into it, so a stalled branch (e.g. a slow GTK
+            // consumer on the preview side) would block the other
+            // branch and everything upstream of the tee, including the
+            // capture source itself.
+            let tee = gst::ElementFactory::make("tee").build().context("failed to create 'tee' element")?;
+            let record_queue = gst::ElementFactory::make("queue")
+                .name("record-queue")
+                .build()
+                .context("failed to create record-branch 'queue' element")?;
+            // Leaky (drops old buffers, not events -- EOS still forwards)
+            // and capped to one buffer: the preview branch may freely
+            // drop frames under load, and must never be able to back up
+            // into the tee and stall the record branch or delay EOS.
+            let preview_queue = gst::ElementFactory::make("queue")
+                .name("preview-queue")
+                .property_from_str("leaky", "downstream")
+                .property("max-size-buffers", 1u32)
+                .property("max-size-bytes", 0u32)
+                .property("max-size-time", 0u64)
+                .build()
+                .context("failed to create preview-branch 'queue' element")?;
+
+            let (preview_scale, preview_capsfilter) = build_preview_scale_chain()?;
+            let preview_elem = preview_sink.upcast_ref::<gst::Element>();
+
+            pipeline
+                .add_many([
+                    &src,
+                    &capsfilter,
+                    &convert,
+                    &tee,
+                    &record_queue,
+                    &encoder,
+                    &parse,
+                    &mux,
+                    &sink,
+                    &preview_queue,
+                    &preview_scale,
+                    &preview_capsfilter,
+                    preview_elem,
+                ])
+                .context("failed to add elements to pipeline")?;
+
+            gst::Element::link_many([&src, &capsfilter, &convert, &tee]).context("failed to link capture chain to tee")?;
+            gst::Element::link_many([&tee, &record_queue, &encoder, &parse, &mux, &sink]).context("failed to link record branch")?;
+            gst::Element::link_many([&tee, &preview_queue, &preview_scale, &preview_capsfilter, preview_elem])
+                .context("failed to link preview branch")?;
+        }
+    }
 
     // audio.rs adds its own elements to `pipeline` directly (elements
     // must belong to the pipeline before they're linked -- see the

@@ -15,10 +15,14 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use gstreamer as gst;
+use gstreamer::prelude::*;
+use gstreamer_app as gst_app;
+use gtk4::gdk;
 use gtk4::glib;
 use gtk4::glib::object::IsA;
 use gtk4::prelude::*;
@@ -59,6 +63,17 @@ enum RecordingOutcome {
     Failed(anyhow::Error),
 }
 
+/// One decoded preview frame, plain `Send` data only -- constructed on
+/// the GStreamer streaming thread (inside the appsink callback), read on
+/// the GTK main thread. Never holds a GTK/GDK type directly (those are
+/// `!Send`).
+struct LatestFrame {
+    width: i32,
+    height: i32,
+    stride: usize,
+    data: Vec<u8>, // BGRA, tightly packed
+}
+
 /// All GUI state that outlives a single event -- lives only on the GTK
 /// main thread (`Rc<RefCell<_>>`, not `Arc<Mutex<_>>`), since only the
 /// stop flag and the channel actually need to cross into the background
@@ -72,6 +87,7 @@ struct Gui {
     stop_btn: gtk4::Button,
     status_label: gtk4::Label,
     toasts: adw::ToastOverlay,
+    preview: gtk4::Picture,
     sources: Vec<SourceChoice>,
 
     recording: bool,
@@ -83,6 +99,19 @@ struct Gui {
     /// the status text as "Stopped" rather than "Stopped early", since
     /// "early" implies a deadline the user never actually set.
     indefinite: bool,
+    /// Written by whichever appsink callback is currently active (either
+    /// the standalone preview pipeline below, or the recording
+    /// pipeline's own tee'd-in branch), read and cleared once per
+    /// `schedule_tick` firing (see `build_preview_sink`).
+    preview_latest: Option<Arc<Mutex<Option<LatestFrame>>>>,
+    /// The lightweight, encoder/file-free pipeline that shows a live
+    /// preview whenever a recording *isn't* in progress -- started at
+    /// window-open and restarted on every source change, so picking a
+    /// source shows what it looks like before committing to Record
+    /// (the recording pipeline's own tee'd preview branch takes over
+    /// only once actually recording; see `start_recording`/
+    /// `finish_recording`). `None` exactly when `recording` is `true`.
+    preview_pipeline: Option<gst::Pipeline>,
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -134,12 +163,25 @@ fn build_ui(app: &adw::Application) {
     let status_label = gtk4::Label::new(Some("Idle"));
     status_label.set_xalign(0.0);
 
+    // Blank (no paintable) until a recording is started; reset to blank
+    // again once one finishes rather than leaving the last frame up,
+    // which would misleadingly look still-live. Permanently in the
+    // layout (never hidden) so the window doesn't jump size every
+    // Record/Stop.
+    let preview = gtk4::Picture::new();
+    preview.set_content_fit(gtk4::ContentFit::Contain);
+    preview.set_can_shrink(true);
+    preview.set_hexpand(true);
+    preview.set_size_request(-1, 180);
+    preview.add_css_class("card");
+
     let form = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     form.set_margin_top(18);
     form.set_margin_bottom(18);
     form.set_margin_start(18);
     form.set_margin_end(18);
 
+    form.append(&preview);
     form.append(&labeled_row("Source:", &source_dd));
     form.append(&labeled_row("Audio:", &audio_dd));
 
@@ -177,17 +219,36 @@ fn build_ui(app: &adw::Application) {
         stop_btn: stop_btn.clone(),
         status_label: status_label.clone(),
         toasts: toasts.clone(),
+        preview: preview.clone(),
         sources,
         recording: false,
         stop_requested: None,
         rx: None,
         started_at: None,
         indefinite: false,
+        preview_latest: None,
+        preview_pipeline: None,
     }));
 
     {
         let state = Rc::clone(&state);
         record_btn.connect_clicked(move |_| start_recording(&state));
+    }
+    {
+        let state = Rc::clone(&state);
+        // Re-point the standalone preview at whatever's newly selected --
+        // this is what lets picking a source show it live before ever
+        // touching Record. Only fires from a user selection (not from
+        // the initial construction above, since this handler isn't
+        // attached yet at that point) and never while recording, since
+        // the dropdown is insensitive then (see set_controls_for_recording).
+        source_dd.connect_selected_notify(move |_| {
+            let mut gui = state.borrow_mut();
+            if !gui.recording {
+                stop_standalone_preview(&mut gui);
+                start_standalone_preview(&mut gui);
+            }
+        });
     }
     {
         let state = Rc::clone(&state);
@@ -226,6 +287,8 @@ fn build_ui(app: &adw::Application) {
         });
     }
 
+    start_standalone_preview(&mut state.borrow_mut());
+    schedule_preview_tick(Rc::clone(&state));
     window.present();
 }
 
@@ -286,6 +349,119 @@ fn build_capture_source(choice: SourceChoice) -> CaptureSource {
     CaptureSource::X11Screen(cfg)
 }
 
+/// Starts (or restarts) the standalone, non-recording preview pipeline
+/// for whatever source is currently selected. A no-op precondition, not
+/// enforced here, is that `gui.recording` is `false` -- callers (the
+/// source-dropdown handler, window setup, and `finish_recording`) only
+/// ever call this outside of a recording; during one, the recording
+/// pipeline's own tee'd branch is what feeds the preview instead.
+fn start_standalone_preview(gui: &mut Gui) {
+    let choice = gui.sources.get(gui.source_dd.selected() as usize).copied().unwrap_or(SourceChoice::FullScreen);
+    let source = build_capture_source(choice);
+    let (appsink, latest) = build_preview_sink();
+
+    match pipeline::build_preview_only_pipeline(&source, &appsink) {
+        Ok(pipeline) => match pipeline.set_state(gst::State::Playing) {
+            Ok(_) => {
+                gui.preview_pipeline = Some(pipeline);
+                gui.preview_latest = Some(latest);
+            }
+            Err(err) => {
+                gui.toasts.add_toast(adw::Toast::new(&format!("Couldn't start preview: {err}")));
+                gui.preview.set_paintable(None::<&gdk::Paintable>);
+            }
+        },
+        Err(err) => {
+            gui.toasts.add_toast(adw::Toast::new(&format!("Couldn't start preview: {err:#}")));
+            gui.preview.set_paintable(None::<&gdk::Paintable>);
+        }
+    }
+}
+
+/// Tears down the standalone preview pipeline, if one is running. No EOS
+/// needed -- unlike a recording pipeline, there's no file/muxer to flush.
+fn stop_standalone_preview(gui: &mut Gui) {
+    if let Some(pipeline) = gui.preview_pipeline.take() {
+        let _ = pipeline.set_state(gst::State::Null);
+    }
+    gui.preview_latest = None;
+}
+
+/// Builds an `appsink` that decodes each frame into a plain `Send`
+/// `LatestFrame` and stores it in the returned `Arc<Mutex<...>>` --
+/// nothing GTK-specific crosses the thread boundary. The `new_sample`
+/// callback fires on a GStreamer streaming thread, and `gtk4::Picture`
+/// (like all GTK widgets, and even a `WeakRef` to one) is `!Send`, so it
+/// can never be captured there, directly or weakly. Instead, the
+/// existing `schedule_tick` GTK-thread timer (already running once
+/// every 250ms with no `Send` bound, since `timeout_add_local`'s
+/// closure only needs to be `'static`) picks up whatever's latest and
+/// updates the `Picture` itself -- reusing the same polling pattern
+/// already driving the elapsed-time label and the outcome channel,
+/// rather than adding a second, `MainContext::invoke`-based mechanism.
+/// A capped, thumbnail-sized preview has no need to update faster than
+/// that tick anyway.
+fn build_preview_sink() -> (gst_app::AppSink, Arc<Mutex<Option<LatestFrame>>>) {
+    let latest: Arc<Mutex<Option<LatestFrame>>> = Arc::new(Mutex::new(None));
+
+    let preview_caps = gst::Caps::builder("video/x-raw").field("format", "BGRA").build();
+    let appsink = gst_app::AppSink::builder().name("preview-sink").caps(&preview_caps).max_buffers(1u32).drop(true).sync(false).build();
+    // appsink's default wait-on-eos blocks EOS handling until a
+    // pull_sample()-style consumer catches up -- irrelevant (and
+    // actively harmful, since it'd add a stall) for a push-callback
+    // consumer like this one that never pulls. Without this, EOS could
+    // be delayed by however long the GTK thread takes to drain frames.
+    appsink.set_wait_on_eos(false);
+
+    appsink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample({
+                let latest = Arc::clone(&latest);
+                move |appsink: &gst_app::AppSink| -> Result<gst::FlowSuccess, gst::FlowError> {
+                    let sample = appsink.pull_sample().map_err(|_| gst::FlowError::Error)?;
+                    if let Some(frame) = extract_frame(&sample) {
+                        // Simply overwrite -- a preview doesn't need
+                        // every frame, only whatever's newest by the
+                        // time the tick next checks.
+                        *latest.lock().unwrap() = Some(frame);
+                    }
+                    Ok(gst::FlowSuccess::Ok)
+                }
+            })
+            .build(),
+    );
+
+    (appsink, latest)
+}
+
+/// Converts one pulled `gst::Sample` (BGRA, per the appsink's caps) into
+/// plain owned bytes safe to hand to the GTK thread. Returns `None` on
+/// any malformed/unexpected sample rather than failing the pipeline --
+/// dropping an occasional bad preview frame is harmless.
+fn extract_frame(sample: &gst::Sample) -> Option<LatestFrame> {
+    let buffer = sample.buffer()?;
+    let s = sample.caps()?.structure(0)?;
+    let width: i32 = s.get("width").ok()?;
+    let height: i32 = s.get("height").ok()?;
+    let map = buffer.map_readable().ok()?;
+    // BGRA is 4 bytes/pixel, so width*4 is always already a multiple of
+    // 4 -- GStreamer's default raw-video row alignment never pads this
+    // format, so stride == width*4 exactly (double-checked below rather
+    // than trusted blindly).
+    let stride = (width as usize) * 4;
+    let data = map.as_slice();
+    if data.len() != stride * height as usize {
+        return None;
+    }
+    Some(LatestFrame { width, height, stride, data: data.to_vec() })
+}
+
+fn show_frame(picture: &gtk4::Picture, frame: LatestFrame) {
+    let bytes = glib::Bytes::from_owned(frame.data);
+    let texture = gdk::MemoryTexture::new(frame.width, frame.height, gdk::MemoryFormat::B8g8r8a8, &bytes, frame.stride);
+    picture.set_paintable(Some(&texture));
+}
+
 /// Reads the form, validates it, and (if valid) spawns the background
 /// recording thread and starts the UI tick that watches it.
 fn start_recording(state: &Rc<RefCell<Gui>>) {
@@ -331,14 +507,26 @@ fn start_recording(state: &Rc<RefCell<Gui>>) {
         (source, cfg, duration, indefinite)
     };
 
+    // Release the standalone preview's capture of this source before the
+    // recording pipeline claims it -- avoids two ximagesrcs briefly
+    // capturing the same source at once. The recording pipeline's own
+    // tee'd branch (below) takes over feeding the preview from here.
+    stop_standalone_preview(&mut state.borrow_mut());
+
     let stop_requested = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let stop_for_thread = Arc::clone(&stop_requested);
     let output = cfg.output_path.clone();
 
+    // The AppSink -- like the rest of the pipeline -- moves into the
+    // background thread. GStreamer elements are already proven Send in
+    // this codebase (the whole gst::Pipeline moves into this same
+    // thread today).
+    let (preview_sink, preview_latest) = build_preview_sink();
+
     std::thread::spawn(move || {
         let result: anyhow::Result<bool> = (|| {
-            let pipeline = pipeline::build_recording_pipeline(&source, &cfg)?;
+            let pipeline = pipeline::build_recording_pipeline_with_preview(&source, &cfg, &preview_sink)?;
             record::run_recording(&pipeline, duration, &stop_for_thread)?;
             Ok(stop_for_thread.load(Ordering::SeqCst)) // did Stop get clicked?
         })();
@@ -356,14 +544,34 @@ fn start_recording(state: &Rc<RefCell<Gui>>) {
         gui.rx = Some(rx);
         gui.started_at = Some(Instant::now());
         gui.indefinite = indefinite;
+        gui.preview_latest = Some(preview_latest);
         set_controls_for_recording(&gui, true);
     }
     schedule_tick(Rc::clone(state));
 }
 
-/// Ticks 4x/sec on the GTK main thread: updates the elapsed-time label
-/// and polls the channel for the background thread's result. Returning
-/// `ControlFlow::Break` once that arrives cancels this same timeout.
+/// Runs forever (unlike `schedule_tick`, which only lives for the
+/// duration of one recording), 4x/sec, showing whatever's the latest
+/// preview frame (see `build_preview_sink`). One tick serves both
+/// preview producers -- the standalone preview pipeline and, during a
+/// recording, the recording pipeline's own tee'd-in branch -- since
+/// only one of them is ever writing into `gui.preview_latest` at a time.
+fn schedule_preview_tick(state: Rc<RefCell<Gui>>) {
+    glib::timeout_add_local(Duration::from_millis(250), move || {
+        let gui = state.borrow();
+        if let Some(latest) = &gui.preview_latest
+            && let Some(frame) = latest.lock().unwrap().take()
+        {
+            show_frame(&gui.preview, frame);
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Ticks 4x/sec on the GTK main thread, only while a recording is in
+/// progress: updates the elapsed-time label and polls the channel for
+/// the background thread's result. Returning `ControlFlow::Break` once
+/// that arrives cancels this same timeout.
 fn schedule_tick(state: Rc<RefCell<Gui>>) {
     glib::timeout_add_local(Duration::from_millis(250), move || {
         let mut gui = state.borrow_mut();
@@ -398,6 +606,11 @@ fn finish_recording(gui: &mut Gui, outcome: RecordingOutcome) {
     gui.rx = None;
     gui.started_at = None;
     set_controls_for_recording(gui, false);
+    // Resume the live idle preview now that the recording pipeline (and
+    // its tee'd branch) is gone -- overwrites preview_latest with a
+    // fresh one of its own; the still-running schedule_preview_tick
+    // picks up its frames the same way it did the recording's.
+    start_standalone_preview(gui);
 
     match outcome {
         RecordingOutcome::Finished { stopped_early, output } => {
