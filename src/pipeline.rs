@@ -60,11 +60,7 @@ pub fn build_preview_only_pipeline(source: &CaptureSource, preview_sink: &gst_ap
     // (source.rs) needs an explicit framerate cap or negotiation is left
     // to whatever the source defaults to.
     const PREVIEW_FRAMERATE: i32 = 15;
-    let caps = gst::Caps::builder("video/x-raw").field("framerate", gst::Fraction::new(PREVIEW_FRAMERATE, 1)).build();
-    let capsfilter = gst::ElementFactory::make("capsfilter")
-        .property("caps", &caps)
-        .build()
-        .context("failed to create 'capsfilter' element")?;
+    let capsfilter = build_framerate_capsfilter(PREVIEW_FRAMERATE)?;
 
     let (preview_scale, preview_capsfilter) = build_preview_scale_chain()?;
     let preview_elem = preview_sink.upcast_ref::<gst::Element>();
@@ -108,6 +104,18 @@ fn build_preview_scale_chain() -> Result<(gst::Element, gst::Element)> {
     Ok((preview_scale, preview_capsfilter))
 }
 
+/// Builds a `capsfilter` pinning an explicit `video/x-raw` framerate --
+/// shared by the recording pipeline (forcing a steady capture rate
+/// against ximagesrc's use-damage=false, see source.rs) and the
+/// preview-only pipeline (capping its independent, lower update rate).
+fn build_framerate_capsfilter(framerate: i32) -> Result<gst::Element> {
+    let caps = gst::Caps::builder("video/x-raw").field("framerate", gst::Fraction::new(framerate, 1)).build();
+    gst::ElementFactory::make("capsfilter")
+        .property("caps", &caps)
+        .build()
+        .context("failed to create 'capsfilter' element")
+}
+
 /// Shared by both entry points above so the muxer/audio-branch wiring
 /// (and its carefully worded error context) lives in exactly one place --
 /// only the tee-insertion point differs between the CLI's plain path and
@@ -122,13 +130,7 @@ fn build_recording_pipeline_inner(source: &CaptureSource, cfg: &RecordConfig, pr
     // pixels change, giving a variable framerate that desyncs badly on
     // an idle screen. With use-damage=false, this caps filter is what
     // actually forces a steady rate.
-    let caps = gst::Caps::builder("video/x-raw")
-        .field("framerate", gst::Fraction::new(cfg.framerate as i32, 1))
-        .build();
-    let capsfilter = gst::ElementFactory::make("capsfilter")
-        .property("caps", &caps)
-        .build()
-        .context("failed to create 'capsfilter' element")?;
+    let capsfilter = build_framerate_capsfilter(cfg.framerate as i32)?;
 
     // ximagesrc outputs the X11 display's native pixel format (commonly
     // BGRx); x264enc needs a colorspace it understands, so this is

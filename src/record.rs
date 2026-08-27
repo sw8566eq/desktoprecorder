@@ -35,7 +35,7 @@ pub fn run_recording(pipeline: &gst::Pipeline, duration: Duration, stop_requeste
         if let Some(msg) = bus.timed_pop_filtered(timeout, &[gst::MessageType::Error, gst::MessageType::Eos]) {
             match msg.view() {
                 gst::MessageView::Error(err) => {
-                    pipeline.set_state(gst::State::Null).ok();
+                    force_null(pipeline);
                     anyhow::bail!(
                         "pipeline error from {:?}: {} ({:?})",
                         err.src().map(|s| s.path_string()),
@@ -54,15 +54,27 @@ pub fn run_recording(pipeline: &gst::Pipeline, duration: Duration, stop_requeste
                 // tests), so finalize() would stall for the full
                 // EOS_TIMEOUT_SECS before giving up -- skip straight to
                 // Null instead.
-                gst::MessageView::Eos(_) => {
-                    return pipeline.set_state(gst::State::Null).map(|_| ()).context("failed to set pipeline to Null after EOS");
-                }
+                gst::MessageView::Eos(_) => return set_null(pipeline),
                 _ => {}
             }
         }
     }
 
     finalize(pipeline, &bus)
+}
+
+/// Best-effort teardown for when we're already returning (or about to
+/// return) a more important error -- a failure to reach Null here
+/// shouldn't shadow that original error, so this swallows its own.
+fn force_null(pipeline: &gst::Pipeline) {
+    pipeline.set_state(gst::State::Null).ok();
+}
+
+/// The non-error-path teardown: reaching Null itself is the thing that
+/// can fail here, so unlike `force_null`, that failure is what gets
+/// reported.
+fn set_null(pipeline: &gst::Pipeline) -> Result<()> {
+    pipeline.set_state(gst::State::Null).map(|_| ()).context("failed to set pipeline to Null after EOS")
 }
 
 /// Sends EOS and blocks (with a safety-net timeout) until it has actually
@@ -80,7 +92,7 @@ fn finalize(pipeline: &gst::Pipeline, bus: &gst::Bus) -> Result<()> {
     ) {
         Some(msg) if matches!(msg.view(), gst::MessageView::Eos(_)) => {}
         Some(msg) => {
-            pipeline.set_state(gst::State::Null).ok();
+            force_null(pipeline);
             anyhow::bail!("error while finalizing recording: {:?}", msg);
         }
         None => {
@@ -88,10 +100,7 @@ fn finalize(pipeline: &gst::Pipeline, bus: &gst::Bus) -> Result<()> {
         }
     }
 
-    pipeline
-        .set_state(gst::State::Null)
-        .context("failed to set pipeline to Null after EOS")?;
-    Ok(())
+    set_null(pipeline)
 }
 
 /// Unlike the other modules' tests, these actually run pipelines to

@@ -17,7 +17,7 @@ use gstreamer as gst;
 
 use cli::{AudioMode, Cli, Command, Container, RecordArgs};
 use pipeline::RecordConfig;
-use source::{CaptureSource, X11ScreenConfig};
+use source::{CaptureSource, Region, X11ScreenConfig};
 
 fn main() -> ExitCode {
     match run() {
@@ -138,10 +138,7 @@ fn list_sources_command() -> Result<()> {
     let monitors = x11_query::list_monitors().context("failed to list monitors")?;
     for m in &monitors {
         let primary = if m.primary { " (primary)" } else { "" };
-        println!(
-            "  {:<3} {:<12}{}  {}x{}+{}+{}",
-            m.index, m.name, primary, m.region.width, m.region.height, m.region.x, m.region.y
-        );
+        println!("  {:<3} {:<12}{}  {}", m.index, m.name, primary, format_region(&m.region));
     }
 
     println!("\nWindows (--window <id>):");
@@ -149,10 +146,7 @@ fn list_sources_command() -> Result<()> {
         Ok(windows) if windows.is_empty() => println!("  (none found)"),
         Ok(windows) => {
             for w in &windows {
-                let geom = match w.region {
-                    Some(r) => format!("{}x{}+{}+{}", r.width, r.height, r.x, r.y),
-                    None => "position/size unknown".to_string(),
-                };
+                let geom = w.region.as_ref().map_or_else(|| "position/size unknown".to_string(), format_region);
                 println!("  {:#010x}  [{}] {}  {}", w.xid, w.class, w.title, geom);
             }
         }
@@ -160,4 +154,10 @@ fn list_sources_command() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// `list-sources`' shared "WxH+X+Y" geometry format, for both monitors
+/// and windows.
+fn format_region(r: &Region) -> String {
+    format!("{}x{}+{}+{}", r.width, r.height, r.x, r.y)
 }

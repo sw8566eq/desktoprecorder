@@ -360,11 +360,7 @@ fn build_ui(app: &adw::Application, active_stop: Arc<Mutex<Option<Arc<AtomicBool
     }
     {
         let state = Rc::clone(&state);
-        stop_btn.connect_clicked(move |_| {
-            if let Some(flag) = &state.borrow().stop_requested {
-                flag.store(true, Ordering::SeqCst);
-            }
-        });
+        stop_btn.connect_clicked(move |_| request_stop(&state));
     }
     {
         let output_entry = output_entry.clone();
@@ -387,7 +383,7 @@ fn build_ui(app: &adw::Application, active_stop: Arc<Mutex<Option<Arc<AtomicBool
         window.connect_close_request(move |_| {
             let recording = state.borrow().recording;
             if recording {
-                state.borrow().toasts.add_toast(adw::Toast::new("Stop the recording before closing"));
+                toast(&state.borrow().toasts, "Stop the recording before closing");
                 glib::Propagation::Stop
             } else {
                 glib::Propagation::Proceed
@@ -439,6 +435,12 @@ fn build_preset_dropdown() -> gtk4::DropDown {
     preset_dd
 }
 
+/// Every user-visible error/status message in this file goes through a
+/// toast -- this is the one place that knows how.
+fn toast(toasts: &adw::ToastOverlay, message: &str) {
+    toasts.add_toast(adw::Toast::new(message));
+}
+
 fn labeled_row(label: &str, control: &impl IsA<gtk4::Widget>) -> gtk4::Box {
     let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     let label_widget = gtk4::Label::new(Some(label));
@@ -466,9 +468,7 @@ fn build_source_choices(toasts: &adw::ToastOverlay) -> (Vec<String>, Vec<SourceC
                 choices.push(SourceChoice::Monitor(m.region));
             }
         }
-        Err(err) => {
-            toasts.add_toast(adw::Toast::new(&format!("Could not list monitors: {err:#}")));
-        }
+        Err(err) => toast(toasts, &format!("Could not list monitors: {err:#}")),
     }
 
     match x11_query::list_windows() {
@@ -503,26 +503,32 @@ fn build_capture_source(choice: SourceChoice) -> CaptureSource {
 /// ever call this outside of a recording; during one, the recording
 /// pipeline's own tee'd branch is what feeds the preview instead.
 fn start_standalone_preview(gui: &mut Gui) {
-    let choice = gui.sources.get(gui.source_dd.selected() as usize).copied().unwrap_or(SourceChoice::FullScreen);
-    let source = build_capture_source(choice);
+    let source = build_capture_source(selected_source_choice(gui));
     let (appsink, latest) = build_preview_sink();
 
-    match pipeline::build_preview_only_pipeline(&source, &appsink) {
-        Ok(pipeline) => match pipeline.set_state(gst::State::Playing) {
-            Ok(_) => {
-                gui.preview_pipeline = Some(pipeline);
-                gui.preview_latest = Some(latest);
-            }
-            Err(err) => {
-                gui.toasts.add_toast(adw::Toast::new(&format!("Couldn't start preview: {err}")));
-                gui.preview.set_paintable(None::<&gdk::Paintable>);
-            }
-        },
+    let built: anyhow::Result<gst::Pipeline> = (|| {
+        let pipeline = pipeline::build_preview_only_pipeline(&source, &appsink)?;
+        pipeline.set_state(gst::State::Playing).context("failed to start preview pipeline")?;
+        Ok(pipeline)
+    })();
+
+    match built {
+        Ok(pipeline) => {
+            gui.preview_pipeline = Some(pipeline);
+            gui.preview_latest = Some(latest);
+        }
         Err(err) => {
-            gui.toasts.add_toast(adw::Toast::new(&format!("Couldn't start preview: {err:#}")));
+            toast(&gui.toasts, &format!("Couldn't start preview: {err:#}"));
             gui.preview.set_paintable(None::<&gdk::Paintable>);
         }
     }
+}
+
+/// The `SourceChoice` behind the source dropdown's current selection --
+/// shared by the preview pipeline and the recording pipeline so they
+/// never resolve "what's selected" differently.
+fn selected_source_choice(gui: &Gui) -> SourceChoice {
+    gui.sources.get(gui.source_dd.selected() as usize).copied().unwrap_or(SourceChoice::FullScreen)
 }
 
 /// Tears down the standalone preview pipeline, if one is running. No EOS
@@ -617,7 +623,7 @@ fn start_recording(state: &Rc<RefCell<Gui>>) {
 
         let output_text = gui.output_entry.text();
         if output_text.trim().is_empty() {
-            gui.toasts.add_toast(adw::Toast::new("Choose an output path first"));
+            toast(&gui.toasts, "Choose an output path first");
             return;
         }
 
@@ -629,15 +635,14 @@ fn start_recording(state: &Rc<RefCell<Gui>>) {
             match duration_text.parse::<humantime::Duration>() {
                 Ok(d) => *d,
                 Err(_) => {
-                    gui.toasts.add_toast(adw::Toast::new(&format!("Invalid duration \"{duration_text}\" (try e.g. \"10s\", \"2m30s\", or leave it blank)")));
+                    toast(&gui.toasts, &format!("Invalid duration \"{duration_text}\" (try e.g. \"10s\", \"2m30s\", or leave it blank)"));
                     return;
                 }
             }
         };
 
         let output_path = PathBuf::from(output_text.as_str());
-        let choice = gui.sources.get(gui.source_dd.selected() as usize).copied().unwrap_or(SourceChoice::FullScreen);
-        let source = build_capture_source(choice);
+        let source = build_capture_source(selected_source_choice(&gui));
         let audio_mode = AUDIO_MODES[gui.audio_dd.selected() as usize];
         let container = Container::infer_from_path(&output_path);
 
@@ -647,9 +652,7 @@ fn start_recording(state: &Rc<RefCell<Gui>>) {
         // catching here too so it's a toast, not a failed-recording
         // round-trip through the background thread.
         if audio_mode == AudioMode::Both && audio_device.is_some() {
-            gui.toasts.add_toast(adw::Toast::new(
-                "Audio device can't be set for Mic + System audio (it always mixes the default mic with the default sink's monitor)",
-            ));
+            toast(&gui.toasts, "Audio device can't be set for Mic + System audio (it always mixes the default mic with the default sink's monitor)");
             return;
         }
 
@@ -742,15 +745,23 @@ fn schedule_hotkey_tick(state: Rc<RefCell<Gui>>, hotkey_pressed: Arc<AtomicBool>
         if hotkey_pressed.swap(false, Ordering::SeqCst) {
             let recording = state.borrow().recording;
             if recording {
-                if let Some(flag) = &state.borrow().stop_requested {
-                    flag.store(true, Ordering::SeqCst);
-                }
+                request_stop(&state);
             } else {
                 start_recording(&state);
             }
         }
         glib::ControlFlow::Continue
     });
+}
+
+/// Flips the current recording's stop flag, if one is recording --
+/// shared by the Stop button and the hotkey tick, both of which need to
+/// do exactly this and nothing more (`record::run_recording`'s own poll
+/// loop is what actually notices the flag and finalizes).
+fn request_stop(state: &Rc<RefCell<Gui>>) {
+    if let Some(flag) = &state.borrow().stop_requested {
+        flag.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Ticks 4x/sec on the GTK main thread, only while a recording is in
@@ -812,7 +823,7 @@ fn finish_recording(gui: &mut Gui, outcome: RecordingOutcome) {
         }
         RecordingOutcome::Failed(err) => {
             gui.status_label.set_text("Idle");
-            gui.toasts.add_toast(adw::Toast::new(&format!("Recording failed: {err:#}")));
+            toast(&gui.toasts, &format!("Recording failed: {err:#}"));
         }
     }
 }

@@ -3,12 +3,13 @@ use gstreamer as gst;
 
 /// Where the recorded pixels come from.
 ///
-/// Only `X11Screen` is implemented today. A Wayland/`xdg-desktop-portal`
-/// + `pipewiresrc`-based variant is the natural extension for later, once
-/// this needs to run under Wayland instead of X11 -- everything
-/// downstream of `build_element` (pipeline construction, encoding, the
-/// CLI) only ever sees a `gst::Element`, so adding that variant won't
-/// require touching `pipeline.rs` or `record.rs`.
+/// Only `X11Screen` is implemented today. A Wayland variant, built on
+/// `xdg-desktop-portal` and `pipewiresrc` instead, is the natural
+/// extension for later, once this needs to run under Wayland instead of
+/// X11 -- everything downstream of `build_element` (pipeline
+/// construction, encoding, the CLI) only ever sees a `gst::Element`, so
+/// adding that variant won't require touching `pipeline.rs` or
+/// `record.rs`.
 ///
 /// This is deliberately an enum rather than a trait object: there is
 /// exactly one real implementation today, and a trait would only buy
