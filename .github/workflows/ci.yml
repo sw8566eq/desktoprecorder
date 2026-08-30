@@ -23,13 +23,18 @@ jobs:
         run: |
           apt-get update
           # Keep this list in sync with README.md's Requirements section.
+          # pulseaudio (the server, not just -utils) is CI-only: audio.rs's
+          # tests shell out to a real `pactl get-default-sink` even at
+          # build time (see CLAUDE.md), which needs something to actually
+          # answer -- the dev box always has a session daemon running;
+          # this container starts one of its own below.
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential pkg-config curl ca-certificates \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
             gstreamer1.0-libav gstreamer1.0-tools \
             libgtk-4-dev libadwaita-1-dev \
-            pulseaudio-utils
+            pulseaudio pulseaudio-utils
 
       - name: Install Rust
         run: |
@@ -41,12 +46,27 @@ jobs:
       - name: cargo build
         run: cargo build --verbose
 
+      - name: Start PulseAudio
+        run: |
+          # --system: there's no login session in this container to
+          # autospawn a per-user daemon, and this step runs as root --
+          # --system is PulseAudio's own supported mode for exactly that
+          # (a headless/container daemon, not tied to a session). A
+          # fresh install's default.pa loads module-always-sink, so
+          # get-default-sink resolves to a real (null) sink with no
+          # further setup.
+          pulseaudio --system --daemonize=yes --disallow-exit=yes --exit-idle-time=-1 --log-target=stderr
+          sleep 2
+          pactl info
+          pactl get-default-sink
+
       - name: cargo test
         run: cargo test --verbose
-        # No display/X11 connection needed: by design, nothing in the
+        # No X11/display connection needed: by design, nothing in the
         # suite touches a live X server (see CLAUDE.md's Tests section) --
-        # this is exactly the assumption that was flagged as worth
-        # confirming outside the dev box, and it holds here.
+        # that assumption held here. PulseAudio is the one live service
+        # some tests do need (audio.rs, see above), hence the step above
+        # rather than skipping that coverage in CI.
 
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
