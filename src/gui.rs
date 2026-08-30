@@ -966,7 +966,7 @@ mod tests {
 
     #[test]
     fn build_capture_source_full_screen_has_no_region_or_xid() {
-        let CaptureSource::X11Screen(cfg) = build_capture_source(SourceChoice::FullScreen);
+        let CaptureSource::X11Screen(cfg) = build_capture_source(SourceChoice::FullScreen) else { unreachable!("build_capture_source never returns Portal") };
         assert!(cfg.region.is_none());
         assert!(cfg.xid.is_none());
     }
@@ -974,14 +974,14 @@ mod tests {
     #[test]
     fn build_capture_source_monitor_sets_region_only() {
         let region = Region { x: 0, y: 0, width: 1920, height: 1080 };
-        let CaptureSource::X11Screen(cfg) = build_capture_source(SourceChoice::Monitor(region));
+        let CaptureSource::X11Screen(cfg) = build_capture_source(SourceChoice::Monitor(region)) else { unreachable!("build_capture_source never returns Portal") };
         assert_eq!(cfg.region, Some(region));
         assert!(cfg.xid.is_none());
     }
 
     #[test]
     fn build_capture_source_window_sets_xid_only() {
-        let CaptureSource::X11Screen(cfg) = build_capture_source(SourceChoice::Window(0x2c00003));
+        let CaptureSource::X11Screen(cfg) = build_capture_source(SourceChoice::Window(0x2c00003)) else { unreachable!("build_capture_source never returns Portal") };
         assert_eq!(cfg.xid, Some(0x2c00003));
         assert!(cfg.region.is_none());
     }
