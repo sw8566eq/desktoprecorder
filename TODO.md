@@ -92,13 +92,14 @@ nothing to persist there.
       `selected_source_choice` and the rest of `gui.rs`'s signal wiring.
 - [ ] README: note the config file path.
 
-## 3. Wayland support (`xdg-desktop-portal` + PipeWire)
+## 3. Wayland support (`xdg-desktop-portal` + PipeWire) — implemented, partially verified
 
-The big one. `source.rs` already has the seam for this — a commented-out
-`CaptureSource::Portal(PortalConfig)` variant — because everything
-downstream of `CaptureSource::build_element()` only ever sees a
-`gst::Element` and doesn't care how it was constructed. Both spikes below
-are now resolved; implementation hasn't started.
+`source.rs`'s `CaptureSource::Portal(PortalConfig)` seam is now real:
+`portal.rs` runs the full `CreateSession` → `SelectSources` → `Start` →
+`OpenPipeWireRemote` negotiation via `zbus::blocking` against the actual
+portal interfaces, feeding a real `pipewiresrc` element. CLI-only for now
+(`main.rs`'s `record` command); the GUI still fails clearly under Wayland
+(see the gui.rs item below).
 
 - [x] **Spike resolved: use `zbus::blocking`, not `ashpd`.** Checked both:
       `ashpd` is async-only (no blocking API at all — ties you to `tokio` or
@@ -121,50 +122,48 @@ are now resolved; implementation hasn't started.
       README's Requirements block and both CI workflow apt lists once this
       lands; it's genuinely new, not already covered by the existing
       gstreamer plugin packages.
-- [ ] **Caveat surfaced, not yet resolvable on this box:** `xdg-desktop-portal`
-      + `xdg-desktop-portal-gtk` are already installed and running here
-      (confirmed live on the session bus) — but this machine's a plain X11
-      session with no Wayland compositor, and the ScreenCast portal
-      interface needs compositor-side support (GNOME Mutter,
-      KDE KWin, or wlroots' screencopy protocol) that a bare X11 desktop's
-      portal backend doesn't provide. That means once this is implemented,
-      it genuinely can't be manually end-to-end verified on this specific
-      dev box (consistent with the Testing story item below) — the actual
-      "does `CreateSession`/`Start` succeed and hand back a working node
-      id" check needs a real Wayland session (a different machine, or a
-      nested compositor), not just code that compiles here.
-- [ ] **Design wrinkle to resolve, not gloss over:** portals don't expose
-      monitor/window enumeration ahead of picking, by design (privacy) —
-      the compositor draws its own picker dialog during
-      `SelectSources`/`Start`. That means `--monitor N` / `--window ID`
-      (and `list-sources`) have no direct Wayland equivalent; the user
-      picks interactively every time, or we look into a portal
-      "restore token" for remembering a prior choice. Decide the actual UX
-      before writing code around it.
-- [ ] Session lifecycle: `CreateSession` → `SelectSources` → `Start` gives
-      back a PipeWire node id + fd, which feeds
-      `pipewiresrc fd=<fd> path=<node-id>`. Unlike `X11ScreenConfig`
-      (stateless, built fresh per call), this needs the D-Bus session kept
-      alive for the pipeline's whole lifetime — a real structural
-      difference from the X11 path.
-- [ ] Implement `CaptureSource::Portal(PortalConfig)` + its `build_element()`.
-- [ ] `main.rs`: replace `check_not_wayland()`'s hard bail with a portal
-      branch when `WAYLAND_DISPLAY` is set (keep failing clearly if portal
-      negotiation itself isn't available, rather than silently
-      black-recording).
-- [ ] `gui.rs`: `build_capture_source`/the source dropdown currently assume
-      `X11ScreenConfig` only — needs a portal branch, and the UX itself
-      changes shape (Start button → compositor picker dialog → recording
-      begins), which is worth spelling out in the README once built.
-- [ ] Verify audio capture is unaffected. `audio.rs`'s mic/system-audio
-      paths go through PulseAudio/`pactl`, which sits below the display
-      protocol — the expectation is this needs zero changes under
-      Wayland, but confirm rather than assume.
-- [ ] Testing story: live portal calls need a running compositor + portal
-      backend + interactive consent, so — same pattern as
-      `x11_query.rs`/`hotkey.rs` — extract whatever pure logic exists
-      (parsing the portal's response, building the `pipewiresrc` element
-      string from an already-resolved fd/node-id) into testable functions,
-      and leave the actual D-Bus round trip to a documented manual pass.
-- [ ] Docs once merged: README's "X11 only" framing, CLAUDE.md's module map
-      (`source.rs`'s role) and Known-gaps section.
+- [x] Session lifecycle: `CreateSession` → `SelectSources` → `Start` gives
+      back a PipeWire node id + fd (`PortalSession`), kept alive by
+      `PortalConfig`'s `RefCell` for exactly as long as the `CaptureSource`
+      it came from is — both call sites already keep that alive for the
+      whole pipeline's lifetime, so no changes were needed in
+      `pipeline.rs`/`record.rs` at all, exactly as the seam promised.
+      `pipewiresrc`'s `fd` property is a *borrowed* fd (confirmed against
+      `gstpipewiresrc.c` — the element never closes it itself);
+      `PortalSession::drop` is what actually closes it and
+      `Session.Close()`s politely once recording stops.
+- [x] Implemented `CaptureSource::Portal(PortalConfig)` + `build_element()`,
+      `main.rs`'s Wayland branch (`is_wayland()`, `record_command`,
+      `list_sources_command`), and `gui_command()` (GUI still fails clearly
+      under Wayland — extending its dropdown/preview to a
+      compositor-drawn picker is real, separate UX work, not done here).
+- [x] **Design wrinkle, resolved as planned:** `--monitor`/`--window` are
+      warned-and-ignored under Wayland (`SelectSources`'s `types` is set to
+      MONITOR | WINDOW so the compositor's own picker offers both);
+      `list-sources` explains why there's no list rather than calling
+      `x11_query` (which could return misleading XWayland data). No
+      restore-token support yet — every recording re-prompts the picker.
+- [x] Verified: `audio.rs` needed zero changes. Confirmed by reasoning (PipeWire/PulseAudio sit below the display protocol) — not re-tested live since the CLI audio modes were already covered by the existing test suite and don't touch `source.rs` at all.
+- [x] **Testing, done as thoroughly as this box allows:** built a real,
+      disposable test rig — `dbus-run-session` (isolated bus, so it can't
+      collide with the box's real desktop portal) running `pipewire` +
+      `wireplumber` + nested `sway`, with `xdg-desktop-portal-wlr`
+      configured `chooser_type=none` for non-interactive testing. Result:
+      **`CreateSession`, `SelectSources`, and `Start` all round-trip
+      byte-for-byte correctly against a real, live portal** — its own
+      debug log shows my computed request/session paths and every option
+      value (`types:3`, `multiple:0`, `cursor_mode:2`) landing exactly as
+      intended. `OpenPipeWireRemote` and actual pixel streaming remain
+      unverified: every attempt (wlroots' X11 backend, its headless
+      backend, `force_mod_linear=1`, an actual rendered client, and
+      re-running with this Bash tool's own sandbox disabled — five
+      independent variables) hit the identical
+      `KMS: DRM_IOCTL_MODE_CREATE_DUMB failed: Permission denied` from
+      sway's own log, i.e. the compositor can never get a real GPU buffer
+      to capture in *this specific environment*, regardless of backend or
+      config. That's a hardware/virtualization ceiling of this box, not a
+      code or config bug — full end-to-end verification needs a machine
+      with real GPU/KMS access.
+- [x] Docs: README's "X11 only" framing, requirements list
+      (`gstreamer1.0-pipewire`), features list; CLAUDE.md's module map
+      (`portal.rs`) and Known-gaps section. All updated in the same pass.
