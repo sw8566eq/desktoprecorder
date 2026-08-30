@@ -11,87 +11,128 @@ the biggest and riskiest, best done last with a safety net already in place.
 
 ---
 
-## 1. CI (GitHub Actions)
+## 1. CI (GitHub Actions) — done, green
 
-Repo already has a remote (`origin` → `sw8566eq/desktoprecorder` on GitHub),
-so this is just adding a workflow file.
+`.github/workflows/ci.yml`, on push/PR to `main`. PR #1 tracks this
+branch; badge added to README.
 
-- [ ] `.github/workflows/ci.yml`, triggered on push/PR to `main`.
-- [ ] **Verify `libadwaita-1-dev` >= 1.7 is actually available** on whatever
-      `ubuntu-latest` resolves to right now — `Cargo.toml` pins the `v1_7`
-      feature, and older Ubuntu apt repos may only carry an older
-      libadwaita. Check before writing the rest of the workflow around an
-      assumption; if it's not there, either pin an older runner image with
-      a PPA, or relax the feature flag (decide which once we know).
-- [ ] Install the same apt package list from README's Requirements block.
-      Keep it in sync manually for now (comment in the workflow pointing
-      back at the README section) rather than over-engineering a shared
-      script for one list.
-- [ ] `cargo build` (skip `--release` in CI for speed unless we want a
-      downloadable artifact out of this — decide when writing the job).
-- [ ] `cargo test` — should run clean with no `Xvfb`/display needed at all,
-      per the existing test design (nothing touches a live X11 connection).
-      Worth confirming on the first real CI run rather than assuming it
-      holds outside this box.
-- [ ] `cargo fmt --check` + `cargo clippy -- -D warnings` as a lint gate.
-      Recommended, not load-bearing for the other two items — fine to land
-      in a follow-up if it turns up a pile of pre-existing warnings.
-- [ ] Cache `~/.cargo` + `target/` (e.g. `Swatinem/rust-cache`) — the
-      gstreamer/gtk4/libadwaita dependency tree is heavy enough that an
-      uncached rebuild every push is a real cost.
-- [ ] Add a status badge to README once green.
+- [x] Workflow file written and actually run (twice failed, once fixed,
+      now green — see below), not just authored and assumed to work.
+- [x] **Resolved: `ubuntu-latest` doesn't have libadwaita ≥ 1.7.** Checked
+      packages.ubuntu.com directly: `ubuntu-latest` is Ubuntu 24.04
+      (libadwaita 1.5.0) as of this writing; even 25.10 only has 1.8.0, and
+      26.04 (1.9.0) is a public-preview runner label, not something to
+      depend on long-term. **Runs in a `debian:trixie` container instead**
+      (`jobs.<job>.container:`) — trixie ships 1.7.6, matching this
+      project's actual dev environment exactly, rather than chasing Ubuntu
+      runner versions.
+- [x] Apt package list kept in sync with README's Requirements block (comment
+      in the workflow points back at it).
+- [x] `cargo build` (not `--release` — this job is about correctness, not a
+      distributable artifact).
+- [x] `cargo test` — confirmed clean with no X11/display needed, exactly as
+      predicted. **What wasn't predicted, and only showed up by actually
+      running it:** `audio.rs`'s System/Both-mode tests failed in the bare
+      container — no PulseAudio *server* at all (`pulseaudio-utils` is
+      client-only). Fixed by installing `pulseaudio` and starting it in
+      `--system` mode. That in turn hit a second real failure: the distro
+      default ACLs the native socket to the `pulse-access` group, and root
+      (there's no non-root user in this container) isn't in it — fixed by
+      loading a minimal config with `auth-anonymous=1` instead of the
+      distro default. Both fixes are the kind of thing no amount of reading
+      the workflow file would have caught — this is exactly why it was
+      worth actually pushing and watching it run rather than stopping at
+      "looks right."
+- [x] `cargo clippy -- -D warnings` — clean, included as a hard gate.
+      `cargo fmt --check` deliberately left out: the existing codebase
+      isn't currently clean under rustfmt's defaults, and reformatting
+      every file is its own follow-up, not something to bundle in here.
+- [x] `Swatinem/rust-cache@v2` added.
+- [x] README badge added.
 
-## 2. Persistent GUI settings
+## 2. Persistent GUI settings — done
 
 Scope: **GUI only.** The CLI's settings are just its argv per invocation —
 nothing to persist there.
 
-- [ ] Add `serde` (+ `derive`), `toml`, and a directories crate (`dirs` or
-      `directories`) — none are dependencies today.
-- [ ] Config location: XDG config dir, e.g.
-      `~/.config/desktoprecorder/config.toml`.
-- [ ] Decide the settings struct's fields. Straightforward: audio mode,
-      audio-device override text, container, framerate, bitrate, preset.
-      Needs an explicit call: **source choice** — remember "full screen" or
-      "monitor N", but not a specific window (window IDs are ephemeral
-      across sessions, a saved one would almost always be stale). **Output
-      path** — deliberately excluded, to avoid silently overwriting
-      yesterday's recording on the next Start.
-- [ ] Load path: in `gui::run()`, construct widgets with today's hardcoded
-      defaults first, then apply the loaded config over them before
-      `window.present()`. A missing file is the common case (first run) —
-      not an error. A partially-corrupt file should fall back to defaults
-      per-field rather than failing the whole GUI over one bad line.
-- [ ] Save path: on successful recording start. (Covers the normal case and
-      survives a later force-kill of the window; simpler than also hooking
-      close-request.)
-- [ ] Unit tests: serialize/deserialize round-trip on the settings struct,
-      and "missing/corrupt file → falls back to defaults" — both pure
-      logic, no display needed, consistent with how the rest of the suite
-      is scoped.
-- [ ] README: note the config file path once this lands.
+- [x] Add `serde` (+ `derive`), `toml`. **Deviation from the original plan:**
+      skipped the `dirs`/`directories` crate — hand-rolled the two-env-var
+      XDG lookup instead (`$XDG_CONFIG_HOME` else `$HOME/.config`), matching
+      this codebase's existing habit of hand-rolling small OS queries
+      directly rather than reaching for a crate over it.
+- [x] Config location: `~/.config/desktoprecorder/config.toml`. **Real
+      finding along the way:** that directory turned out to already exist on
+      this box — an unrelated Electron app's profile (`Cache/`, `Local
+      State`, `Preferences`, etc.), predating this project. Flagged it and
+      confirmed with the user before writing anything there; using the same
+      directory was fine.
+- [x] Settings struct fields: audio mode, audio-device override, framerate,
+      bitrate, preset, and source choice (full screen / monitor index, never
+      a specific window — see reasoning below). **Deviation:** dropped
+      `container` from the original plan — the GUI has no container widget
+      of its own (it's inferred from the output path's extension), so a
+      persisted value would never have anything to apply back to. Output
+      path stays excluded, as planned, so a restored session can't silently
+      overwrite a prior recording on the next Start.
+- [x] Load path: `config::load()` called right after `Gui` is constructed in
+      `build_ui`, before any signal handler is wired up or the first
+      `start_standalone_preview` call. Never fails outright — missing,
+      partial, or corrupt all fall back to per-field defaults.
+- [x] Save path: on a validated Record click (after every input-validation
+      guard has already passed), not on the pipeline actually reaching
+      Playing — `start_recording`'s background thread doesn't report that
+      back synchronously, and gating on it would need new signaling machinery
+      for little real benefit.
+- [x] Unit tests: 12 new ones — `config.rs`'s round-trip/lowercase-spelling/
+      missing-fields/corrupt-TOML/no-resolvable-base cases, plus `gui.rs`'s
+      new pure index-mapping helpers (`source_dropdown_index`,
+      `audio_dropdown_index`, `preset_dropdown_index` and their fallback
+      paths). `settings_source_monitor` (the save-side inverse) takes a live
+      `&Gui` and is left to the same manual, not-automated pass as
+      `selected_source_choice` and the rest of `gui.rs`'s signal wiring.
+- [ ] README: note the config file path.
 
 ## 3. Wayland support (`xdg-desktop-portal` + PipeWire)
 
 The big one. `source.rs` already has the seam for this — a commented-out
 `CaptureSource::Portal(PortalConfig)` variant — because everything
 downstream of `CaptureSource::build_element()` only ever sees a
-`gst::Element` and doesn't care how it was constructed. Start with a spike
-to resolve the open questions below before committing to an approach.
+`gst::Element` and doesn't care how it was constructed. Both spikes below
+are now resolved; implementation hasn't started.
 
-- [ ] **Spike: async runtime vs. blocking D-Bus.** Portal negotiation
-      (`org.freedesktop.portal.ScreenCast`) is naturally done via the
-      `ashpd` crate, but `ashpd` is async and this project has no async
-      runtime today (it's threads + `Arc<Mutex<_>>`/`AtomicBool>`
-      throughout — see the GTK4/gstreamer-rs threading notes in
-      CLAUDE.md). Portal negotiation is a one-shot startup call, not a
-      sustained loop, so pulling in `tokio` for it is disproportionate.
-      Evaluate `zbus`'s blocking API as a hand-rolled alternative before
-      deciding.
-- [ ] **Spike: confirm the `pipewiresrc` GStreamer element is actually
-      available** on this box/distro (may need `gstreamer1.0-pipewire` or
-      be bundled in `gst-plugins-good`/`bad` depending on version — check
-      before assuming the README's existing apt list already covers it).
+- [x] **Spike resolved: use `zbus::blocking`, not `ashpd`.** Checked both:
+      `ashpd` is async-only (no blocking API at all — ties you to `tokio` or
+      an `async-io`-compatible executor). `zbus` ships a real
+      `zbus::blocking` module built specifically for exactly this case
+      ("blocking wrappers are provided for convenience"). Given portal
+      negotiation here is a handful of one-shot calls
+      (`CreateSession`/`SelectSources`/`Start`) rather than a sustained
+      loop, and this project has no async runtime anywhere else (threads +
+      `Arc<Mutex<_>>`/`AtomicBool` throughout, see CLAUDE.md), hand-rolling
+      the `org.freedesktop.portal.ScreenCast` proxy calls directly against
+      `zbus::blocking` is the right trade — a bit more code than `ashpd`'s
+      convenience wrappers would need, in exchange for not pulling in
+      `tokio` for one startup sequence.
+- [x] **Spike resolved: `pipewiresrc` needs an explicit new package.** Not
+      installed by default on Debian trixie (confirmed via `gst-inspect-1.0
+      pipewiresrc` → "No such element or plugin", despite the base PipeWire
+      libraries already being present for unrelated reasons). It's packaged
+      as `gstreamer1.0-pipewire` (1.4.2-1 in trixie's repos) — add this to
+      README's Requirements block and both CI workflow apt lists once this
+      lands; it's genuinely new, not already covered by the existing
+      gstreamer plugin packages.
+- [ ] **Caveat surfaced, not yet resolvable on this box:** `xdg-desktop-portal`
+      + `xdg-desktop-portal-gtk` are already installed and running here
+      (confirmed live on the session bus) — but this machine's a plain X11
+      session with no Wayland compositor, and the ScreenCast portal
+      interface needs compositor-side support (GNOME Mutter,
+      KDE KWin, or wlroots' screencopy protocol) that a bare X11 desktop's
+      portal backend doesn't provide. That means once this is implemented,
+      it genuinely can't be manually end-to-end verified on this specific
+      dev box (consistent with the Testing story item below) — the actual
+      "does `CreateSession`/`Start` succeed and hand back a working node
+      id" check needs a real Wayland session (a different machine, or a
+      nested compositor), not just code that compiles here.
 - [ ] **Design wrinkle to resolve, not gloss over:** portals don't expose
       monitor/window enumeration ahead of picking, by design (privacy) —
       the compositor draws its own picker dialog during

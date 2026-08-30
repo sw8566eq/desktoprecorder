@@ -1,5 +1,7 @@
 # desktoprecorder
 
+[![CI](https://github.com/sw8566eq/desktoprecorder/actions/workflows/ci.yml/badge.svg)](https://github.com/sw8566eq/desktoprecorder/actions/workflows/ci.yml)
+
 A screen recorder for Linux (X11), written in Rust on top of GStreamer. CLI and GTK4/libadwaita GUI, sharing the same recording engine.
 
 ![desktoprecorder GUI](screenshot.png)
@@ -11,6 +13,7 @@ A screen recorder for Linux (X11), written in Rust on top of GStreamer. CLI and 
 - Matroska (`.mkv`) or MP4 output, clean EOS-based shutdown on Ctrl+C/SIGTERM (both CLI and GUI) so files are never left truncated; closing the GUI window mid-recording is refused rather than losing the file
 - GUI: live preview of the selected source (before and during recording), optional duration (blank = record until Stop, capped at 24h), and framerate/bitrate/preset/audio-device controls matching the CLI
 - Global `Ctrl+Alt+R` hotkey to start/stop recording from the GUI, even when the window isn't focused
+- GUI settings (source, audio mode/device, framerate, bitrate, preset) persist across launches, saved to `~/.config/desktoprecorder/config.toml` on each Record click
 
 ## Requirements
 
