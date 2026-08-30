@@ -1,5 +1,6 @@
 mod audio;
 mod cli;
+mod config;
 mod gui;
 mod hotkey;
 mod pipeline;

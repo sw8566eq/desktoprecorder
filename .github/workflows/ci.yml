@@ -51,11 +51,22 @@ jobs:
           # --system: there's no login session in this container to
           # autospawn a per-user daemon, and this step runs as root --
           # --system is PulseAudio's own supported mode for exactly that
-          # (a headless/container daemon, not tied to a session). A
-          # fresh install's default.pa loads module-always-sink, so
-          # get-default-sink resolves to a real (null) sink with no
-          # further setup.
-          pulseaudio --system --daemonize=yes --disallow-exit=yes --exit-idle-time=-1 --log-target=stderr
+          # (a headless/container daemon, not tied to a session).
+          #
+          # The daemon itself now starts fine under --system, but its
+          # default system.pa ACLs the native socket to the pulse-access
+          # group -- root isn't a member (root can't even be, there's no
+          # non-root user in this container to add), so the very first
+          # `pactl` call failed with "Access denied". Loading our own
+          # minimal config instead (-n --file=...), with
+          # auth-anonymous=1, is the actual fix -- module-always-sink is
+          # what makes get-default-sink resolve to a real (null) sink
+          # with no hardware and no further setup.
+          cat > /tmp/pulse-ci.pa <<'EOF'
+          load-module module-always-sink
+          load-module module-native-protocol-unix auth-anonymous=1
+          EOF
+          pulseaudio --system --daemonize=yes --disallow-exit=yes --exit-idle-time=-1 --log-target=stderr -n --file=/tmp/pulse-ci.pa
           sleep 2
           pactl info
           pactl get-default-sink

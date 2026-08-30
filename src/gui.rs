@@ -30,6 +30,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::cli::{AudioMode, Container};
+use crate::config::{self, Settings};
 use crate::hotkey;
 use crate::pipeline::{self, RecordConfig};
 use crate::record;
@@ -338,6 +339,16 @@ fn build_ui(app: &adw::Application, active_stop: Arc<Mutex<Option<Arc<AtomicBool
         active_stop,
     }));
 
+    // Overrides whichever of the above the widgets were just built with,
+    // if anything was ever saved -- before any signal handler is wired
+    // up below and before the first start_standalone_preview call at the
+    // end of this function, so nothing has to be redone once the
+    // restored values are in place. config::load never fails outright
+    // (see config.rs), so there's no error path here to handle -- a
+    // missing/corrupt file just leaves the widgets' own hardcoded
+    // defaults in place.
+    apply_settings(&config::load(), &state.borrow());
+
     {
         let state = Rc::clone(&state);
         record_btn.connect_clicked(move |_| start_recording(&state));
@@ -531,6 +542,64 @@ fn selected_source_choice(gui: &Gui) -> SourceChoice {
     gui.sources.get(gui.source_dd.selected() as usize).copied().unwrap_or(SourceChoice::FullScreen)
 }
 
+/// Which row of the source dropdown `settings.source_monitor` refers to,
+/// given `sources` (built fresh by `build_source_choices` at startup --
+/// see `Settings::source_monitor`'s doc comment for why a saved *window*
+/// never reaches here). Row 0 (full screen) is the fallback both when
+/// nothing was saved and when the saved index no longer resolves to a
+/// monitor -- e.g. one was unplugged since the settings file was
+/// written -- rather than that being an error worth surfacing.
+fn source_dropdown_index(settings: &Settings, sources: &[SourceChoice]) -> u32 {
+    let Some(monitor_index) = settings.source_monitor else {
+        return 0;
+    };
+    // sources[0] is always FullScreen (see build_source_choices), so a
+    // monitor's dropdown row is one past its list_monitors index.
+    let candidate = monitor_index as usize + 1;
+    match sources.get(candidate) {
+        Some(SourceChoice::Monitor(_)) => candidate as u32,
+        _ => 0,
+    }
+}
+
+/// The inverse of `source_dropdown_index`: what to persist for the
+/// currently-selected source. `None` for full screen *and* for a window
+/// (see `Settings::source_monitor`'s doc comment on why windows aren't
+/// saved).
+fn settings_source_monitor(gui: &Gui) -> Option<u32> {
+    match selected_source_choice(gui) {
+        SourceChoice::Monitor(_) => Some(gui.source_dd.selected() - 1),
+        SourceChoice::FullScreen | SourceChoice::Window(_) => None,
+    }
+}
+
+fn audio_dropdown_index(settings: &Settings) -> u32 {
+    AUDIO_MODES.iter().position(|m| *m == settings.audio_mode).unwrap_or(0) as u32
+}
+
+fn preset_dropdown_index(settings: &Settings) -> u32 {
+    match PRESETS.iter().position(|p| *p == settings.speed_preset) {
+        Some(i) => i as u32,
+        None => DEFAULT_PRESET_INDEX,
+    }
+}
+
+/// Applies loaded settings over the widgets' just-constructed hardcoded
+/// defaults. Called once, at startup, right after `Gui` is built --
+/// before any signal handler is wired up and before the first
+/// `start_standalone_preview`, so the initial preview reflects the
+/// restored source, not the default one.
+fn apply_settings(settings: &Settings, gui: &Gui) {
+    gui.source_dd.set_selected(source_dropdown_index(settings, &gui.sources));
+    gui.audio_dd.set_selected(audio_dropdown_index(settings));
+    if let Some(device) = &settings.audio_device {
+        gui.audio_device_entry.set_text(device);
+    }
+    gui.framerate_spin.set_value(settings.framerate as f64);
+    gui.bitrate_spin.set_value(settings.bitrate_kbps as f64);
+    gui.preset_dd.set_selected(preset_dropdown_index(settings));
+}
+
 /// Tears down the standalone preview pipeline, if one is running. No EOS
 /// needed -- unlike a recording pipeline, there's no file/muxer to flush.
 fn stop_standalone_preview(gui: &mut Gui) {
@@ -665,6 +734,25 @@ fn start_recording(state: &Rc<RefCell<Gui>>) {
             audio_mode,
             audio_device,
         };
+
+        // Every validation guard above has already returned by this
+        // point, so this is a deliberate, validated Record click -- not
+        // just any keystroke -- which is what "on successful start"
+        // means for settings-persistence purposes here (as opposed to
+        // waiting on the background thread's pipeline actually reaching
+        // Playing, which start_recording doesn't learn synchronously;
+        // see the RecordingOutcome channel below).
+        let settings = Settings {
+            source_monitor: settings_source_monitor(&gui),
+            audio_mode: cfg.audio_mode,
+            audio_device: cfg.audio_device.clone(),
+            framerate: cfg.framerate,
+            bitrate_kbps: cfg.bitrate_kbps,
+            speed_preset: cfg.speed_preset.clone(),
+        };
+        if let Err(err) = config::save(&settings) {
+            toast(&gui.toasts, &format!("Recording, but couldn't save settings for next time: {err:#}"));
+        }
 
         (source, cfg, duration, indefinite)
     };
@@ -912,5 +1000,70 @@ mod tests {
         // INDEFINITE_DURATION is 24h, i.e. "1440:00" at the cap) rather
         // than assuming an hh:mm:ss format that isn't what's implemented.
         assert_eq!(format_elapsed(Duration::from_secs(3661)), "61:01");
+    }
+
+    // source_dropdown_index/audio_dropdown_index/preset_dropdown_index are
+    // tested here directly (unlike settings_source_monitor, its inverse,
+    // which takes a live &Gui and so needs real widgets -- same
+    // not-automated boundary as selected_source_choice, see CLAUDE.md).
+
+    fn three_monitor_sources() -> Vec<SourceChoice> {
+        let region = |n: u32| Region { x: 0, y: 0, width: 1920 * n, height: 1080 };
+        vec![
+            SourceChoice::FullScreen,
+            SourceChoice::Monitor(region(1)),
+            SourceChoice::Monitor(region(2)),
+            SourceChoice::Window(0x1234),
+        ]
+    }
+
+    #[test]
+    fn source_dropdown_index_none_selects_full_screen() {
+        let settings = Settings { source_monitor: None, ..Settings::default() };
+        assert_eq!(source_dropdown_index(&settings, &three_monitor_sources()), 0);
+    }
+
+    #[test]
+    fn source_dropdown_index_maps_monitor_index_to_its_row() {
+        let settings = Settings { source_monitor: Some(1), ..Settings::default() };
+        // sources[0] is FullScreen, so monitor index 1 is row 2.
+        assert_eq!(source_dropdown_index(&settings, &three_monitor_sources()), 2);
+    }
+
+    #[test]
+    fn source_dropdown_index_falls_back_to_full_screen_when_monitor_is_gone() {
+        // Saved index 5 doesn't exist in a 4-row list (e.g. a monitor was
+        // unplugged since) -- fall back rather than panic or misfire.
+        let settings = Settings { source_monitor: Some(5), ..Settings::default() };
+        assert_eq!(source_dropdown_index(&settings, &three_monitor_sources()), 0);
+    }
+
+    #[test]
+    fn source_dropdown_index_falls_back_when_the_row_is_now_a_window() {
+        // Saved index 2 would land on sources[3], but that's a Window
+        // today (list_monitors returned one fewer monitor than last
+        // time) -- never silently select a Window from a saved index.
+        let settings = Settings { source_monitor: Some(2), ..Settings::default() };
+        assert_eq!(source_dropdown_index(&settings, &three_monitor_sources()), 0);
+    }
+
+    #[test]
+    fn audio_dropdown_index_matches_saved_mode() {
+        let settings = Settings { audio_mode: AudioMode::System, ..Settings::default() };
+        assert_eq!(audio_dropdown_index(&settings), 2);
+    }
+
+    #[test]
+    fn preset_dropdown_index_matches_saved_preset() {
+        let settings = Settings { speed_preset: "slow".to_string(), ..Settings::default() };
+        assert_eq!(preset_dropdown_index(&settings), PRESETS.iter().position(|p| *p == "slow").unwrap() as u32);
+    }
+
+    #[test]
+    fn preset_dropdown_index_falls_back_to_default_for_an_unknown_preset() {
+        // e.g. a settings file hand-edited to a typo, or written by a
+        // future version with a preset this build doesn't recognize.
+        let settings = Settings { speed_preset: "not-a-real-preset".to_string(), ..Settings::default() };
+        assert_eq!(preset_dropdown_index(&settings), DEFAULT_PRESET_INDEX);
     }
 }

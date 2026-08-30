@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Debug)]
 #[command(name = "desktoprecorder", about = "A Linux screen recorder built on GStreamer")]
@@ -84,7 +85,13 @@ fn parse_window_id(s: &str) -> Result<u64, String> {
 }
 
 /// What audio, if any, to capture alongside the video.
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` are for `config.rs`'s persisted GUI settings
+/// (`rename_all = "lowercase"` so the TOML spelling matches `--audio`'s
+/// own CLI values) -- unrelated to `ValueEnum`, which clap derives its
+/// own casing for independently.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AudioMode {
     /// Video only (default) -- matches milestones 1/2's behavior.
     None,
