@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    # Debian trixie, not bare ubuntu-latest: Cargo.toml pins libadwaita's
+    # `v1_7` feature, but ubuntu-latest (24.04/noble) only carries
+    # libadwaita 1.5 in its apt repos -- that build would fail on missing
+    # symbols. trixie ships 1.7.6, matching this project's actual dev
+    # environment (see CLAUDE.md) instead of chasing a newer Ubuntu
+    # runner label.
+    container:
+      image: debian:trixie
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          # Keep this list in sync with README.md's Requirements section.
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config curl ca-certificates \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav gstreamer1.0-tools \
+            libgtk-4-dev libadwaita-1-dev \
+            pulseaudio-utils
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build
+        run: cargo build --verbose
+
+      - name: cargo test
+        run: cargo test --verbose
+        # No display/X11 connection needed: by design, nothing in the
+        # suite touches a live X server (see CLAUDE.md's Tests section) --
+        # this is exactly the assumption that was flagged as worth
+        # confirming outside the dev box, and it holds here.
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # cargo fmt --check is deliberately not run here yet: the existing
+      # codebase predates rustfmt being applied and isn't currently
+      # clean under its defaults. Reformatting is its own follow-up (it
+      # touches every file) rather than something to bundle into CI setup.
