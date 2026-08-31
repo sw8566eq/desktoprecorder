@@ -21,12 +21,15 @@
 //! against a fast-responding portal. `call_and_wait` below is that dance,
 //! factored out once since all three calls need it identically.
 //!
-//! Unverified beyond compiling cleanly and matching the spec/pipewiresrc
-//! source as closely as this was written against: this dev box is a
-//! plain X11 session with no Wayland compositor, and the ScreenCast
-//! portal backend needs one (GNOME Mutter, KDE KWin, or wlroots'
-//! screencopy protocol) -- there's nothing here to actually run this
-//! against yet. See CLAUDE.md/TODO.md.
+//! Verified against a real, live portal (see TODO.md for the disposable
+//! test rig used): `CreateSession`, `SelectSources`, and `Start` all
+//! round-trip correctly, confirmed by the portal's own debug log echoing
+//! back this code's exact computed request/session paths and option
+//! values. Not verified beyond that -- `Start` never actually succeeded
+//! in that test (a GPU/KMS limitation of the test box, not of this code),
+//! so `OpenPipeWireRemote`, the `streams` field's real shape, and every
+//! line in `source.rs`'s `build_pipewiresrc` that runs after `negotiate`
+//! returns `Ok` have never executed even once, in a test or otherwise.
 
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
