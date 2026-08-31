@@ -1,24 +1,25 @@
+use std::cell::RefCell;
+
 use anyhow::{Context, Result};
 use gstreamer as gst;
 
+use crate::portal::{self, PortalSession};
+
 /// Where the recorded pixels come from.
 ///
-/// Only `X11Screen` is implemented today. A Wayland variant, built on
-/// `xdg-desktop-portal` and `pipewiresrc` instead, is the natural
-/// extension for later, once this needs to run under Wayland instead of
-/// X11 -- everything downstream of `build_element` (pipeline
-/// construction, encoding, the CLI) only ever sees a `gst::Element`, so
-/// adding that variant won't require touching `pipeline.rs` or
-/// `record.rs`.
+/// Everything downstream of `build_element` (pipeline construction,
+/// encoding, the CLI) only ever sees a `gst::Element`, which is what let
+/// `Portal` get added here without touching `pipeline.rs` or `record.rs`
+/// at all -- exactly the seam this enum was written to leave open.
 ///
-/// This is deliberately an enum rather than a trait object: there is
-/// exactly one real implementation today, and a trait would only buy
-/// dynamic dispatch this doesn't need yet. Converting it into a trait
-/// later, if a genuinely pluggable set of sources ever shows up, is a
-/// mechanical refactor -- not a dead end.
+/// This is deliberately an enum rather than a trait object: there are
+/// only ever two real implementations, and a trait would only buy
+/// dynamic dispatch neither needs. Converting it into a trait later, if a
+/// genuinely pluggable set of sources ever shows up, is a mechanical
+/// refactor -- not a dead end.
 pub enum CaptureSource {
     X11Screen(X11ScreenConfig),
-    // Portal(PortalConfig), // future: Wayland via xdg-desktop-portal + pipewiresrc
+    Portal(PortalConfig),
 }
 
 #[derive(Debug, Clone)]
@@ -53,13 +54,37 @@ pub struct Region {
     pub height: u32,
 }
 
+/// There's deliberately no `region`/`xid` here to mirror
+/// `X11ScreenConfig`'s: portals don't expose monitor/window enumeration
+/// ahead of picking, by design (privacy) -- the compositor draws its own
+/// picker during negotiation instead, so there's nothing for a caller to
+/// pre-select. See `portal.rs`'s `negotiate`.
+pub struct PortalConfig {
+    pub show_pointer: bool,
+    /// Populated by `build_element` the first time it's called. `RefCell`
+    /// because `build_element` takes `&self`, but negotiation only
+    /// happens (and only can happen -- it blocks on the user interacting
+    /// with the picker dialog) once an element is actually being built.
+    /// See `PortalSession`'s doc comment for why keeping it alive exactly
+    /// as long as this config -- and therefore the `CaptureSource` it's
+    /// wrapped in -- is the right lifetime.
+    negotiated: RefCell<Option<PortalSession>>,
+}
+
+impl Default for PortalConfig {
+    fn default() -> Self {
+        Self { show_pointer: true, negotiated: RefCell::new(None) }
+    }
+}
+
 impl CaptureSource {
     /// Builds the actual GStreamer source element for this capture
     /// source. Callers only ever get back a `gst::Element` -- they never
-    /// need to know it came from `ximagesrc` specifically.
+    /// need to know it came from `ximagesrc`/`pipewiresrc` specifically.
     pub fn build_element(&self) -> Result<gst::Element> {
         match self {
             CaptureSource::X11Screen(cfg) => build_ximagesrc(cfg),
+            CaptureSource::Portal(cfg) => build_pipewiresrc(cfg),
         }
     }
 }
@@ -86,6 +111,27 @@ fn build_ximagesrc(cfg: &X11ScreenConfig) -> Result<gst::Element> {
     builder
         .build()
         .context("failed to create 'ximagesrc' element (is gstreamer1.0-plugins-good installed?)")
+}
+
+/// Unlike `build_ximagesrc`, this one blocks: `portal::negotiate` waits on
+/// the compositor's own picker dialog and the user interacting with it.
+fn build_pipewiresrc(cfg: &PortalConfig) -> Result<gst::Element> {
+    let session = portal::negotiate(cfg.show_pointer).context(
+        "failed to negotiate screen capture via xdg-desktop-portal (is a portal backend with ScreenCast support running? a plain X11 session typically doesn't have one)",
+    )?;
+
+    let element = gst::ElementFactory::make("pipewiresrc")
+        .property("fd", session.fd_raw())
+        .property("target-object", session.node_id().to_string())
+        .build()
+        .context("failed to create 'pipewiresrc' element (is gstreamer1.0-pipewire installed?)")?;
+
+    // See PortalSession's doc comment: this is what keeps the negotiated
+    // fd (and the D-Bus session used to close it politely) alive for
+    // exactly as long as this CaptureSource value is.
+    *cfg.negotiated.borrow_mut() = Some(session);
+
+    Ok(element)
 }
 
 /// `build_element` just constructs and configures a GStreamer element
