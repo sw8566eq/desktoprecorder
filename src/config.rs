@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::cli::AudioMode;
+use crate::cli::{AudioMode, DEFAULT_BITRATE_KBPS, DEFAULT_FRAMERATE, DEFAULT_SPEED_PRESET};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -46,17 +46,20 @@ pub struct Settings {
 }
 
 impl Default for Settings {
-    /// Matches the GUI's own hardcoded widget defaults (see `gui.rs`'s
-    /// `build_ui`) -- this is what a brand-new install falls back to
-    /// before any config file has ever been written.
+    /// Reuses the CLI's own flag defaults (`cli.rs`) rather than
+    /// hardcoding a second copy of the same numbers -- this is what a
+    /// brand-new install falls back to before any config file has ever
+    /// been written, and what `gui.rs`'s widgets end up showing on first
+    /// launch (see `apply_settings`, called unconditionally right after
+    /// `build_ui` constructs them).
     fn default() -> Self {
         Self {
             source_monitor: None,
             audio_mode: AudioMode::None,
             audio_device: None,
-            framerate: 30,
-            bitrate_kbps: 8000,
-            speed_preset: "veryfast".to_string(),
+            framerate: DEFAULT_FRAMERATE,
+            bitrate_kbps: DEFAULT_BITRATE_KBPS,
+            speed_preset: DEFAULT_SPEED_PRESET.to_string(),
         }
     }
 }

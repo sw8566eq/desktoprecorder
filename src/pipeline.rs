@@ -29,7 +29,7 @@ pub struct RecordConfig {
 /// filesink, plus whatever `audio.rs` adds alongside it); `record.rs`
 /// just drives whatever `gst::Pipeline` comes back through
 /// Playing/EOS/Null without caring how it was assembled.
-pub fn build_recording_pipeline(source: &CaptureSource, cfg: &RecordConfig) -> Result<gst::Pipeline> {
+pub fn build_recording_pipeline(source: &mut CaptureSource, cfg: &RecordConfig) -> Result<gst::Pipeline> {
     build_recording_pipeline_inner(source, cfg, None)
 }
 
@@ -38,7 +38,7 @@ pub fn build_recording_pipeline(source: &CaptureSource, cfg: &RecordConfig) -> R
 /// downscaled, GTK-friendly branch feeding `preview_sink`. `preview_sink`
 /// must already have its caps/callbacks configured (see gui.rs) -- this
 /// only wires it into the graph.
-pub fn build_recording_pipeline_with_preview(source: &CaptureSource, cfg: &RecordConfig, preview_sink: &gst_app::AppSink) -> Result<gst::Pipeline> {
+pub fn build_recording_pipeline_with_preview(source: &mut CaptureSource, cfg: &RecordConfig, preview_sink: &gst_app::AppSink) -> Result<gst::Pipeline> {
     build_recording_pipeline_inner(source, cfg, Some(preview_sink))
 }
 
@@ -49,7 +49,7 @@ pub fn build_recording_pipeline_with_preview(source: &CaptureSource, cfg: &Recor
 /// pipeline above has its own tee'd-in preview branch for that case).
 /// Unlike a recording pipeline, this has nothing to finalize on
 /// shutdown -- callers can just `set_state(Null)`, no EOS needed.
-pub fn build_preview_only_pipeline(source: &CaptureSource, preview_sink: &gst_app::AppSink) -> Result<gst::Pipeline> {
+pub fn build_preview_only_pipeline(source: &mut CaptureSource, preview_sink: &gst_app::AppSink) -> Result<gst::Pipeline> {
     let pipeline = gst::Pipeline::with_name("desktoprecorder-preview-only-pipeline");
     let src = source.build_element()?;
 
@@ -120,7 +120,7 @@ fn build_framerate_capsfilter(framerate: i32) -> Result<gst::Element> {
 /// (and its carefully worded error context) lives in exactly one place --
 /// only the tee-insertion point differs between the CLI's plain path and
 /// the GUI's preview-branching path.
-fn build_recording_pipeline_inner(source: &CaptureSource, cfg: &RecordConfig, preview_sink: Option<&gst_app::AppSink>) -> Result<gst::Pipeline> {
+fn build_recording_pipeline_inner(source: &mut CaptureSource, cfg: &RecordConfig, preview_sink: Option<&gst_app::AppSink>) -> Result<gst::Pipeline> {
     let pipeline = gst::Pipeline::with_name("desktoprecorder-pipeline");
 
     let src = source.build_element()?;
@@ -288,13 +288,13 @@ mod tests {
     #[test]
     fn builds_for_mkv_without_audio() {
         init_gst();
-        build_recording_pipeline(&source(), &base_config(Container::Mkv)).unwrap();
+        build_recording_pipeline(&mut source(), &base_config(Container::Mkv)).unwrap();
     }
 
     #[test]
     fn builds_for_mp4_without_audio() {
         init_gst();
-        build_recording_pipeline(&source(), &base_config(Container::Mp4)).unwrap();
+        build_recording_pipeline(&mut source(), &base_config(Container::Mp4)).unwrap();
     }
 
     #[test]
@@ -307,7 +307,7 @@ mod tests {
         init_gst();
         let mut cfg = base_config(Container::Mkv);
         cfg.audio_mode = AudioMode::Mic;
-        build_recording_pipeline(&source(), &cfg).unwrap();
+        build_recording_pipeline(&mut source(), &cfg).unwrap();
     }
 
     #[test]
@@ -319,7 +319,7 @@ mod tests {
         let mut cfg = base_config(Container::Mkv);
         cfg.audio_mode = AudioMode::Both;
         cfg.audio_device = Some("some-device".to_string());
-        let err = build_recording_pipeline(&source(), &cfg).unwrap_err();
+        let err = build_recording_pipeline(&mut source(), &cfg).unwrap_err();
         assert!(err.to_string().contains("--audio=both"));
     }
 
@@ -327,7 +327,7 @@ mod tests {
     fn preview_variant_adds_a_tee_with_named_record_and_preview_queues() {
         init_gst();
         let appsink = gst_app::AppSink::builder().build();
-        let pipeline = build_recording_pipeline_with_preview(&source(), &base_config(Container::Mkv), &appsink).unwrap();
+        let pipeline = build_recording_pipeline_with_preview(&mut source(), &base_config(Container::Mkv), &appsink).unwrap();
         assert!(pipeline.by_name("record-queue").is_some());
         assert!(pipeline.by_name("preview-queue").is_some());
     }
@@ -336,6 +336,6 @@ mod tests {
     fn preview_only_pipeline_builds() {
         init_gst();
         let appsink = gst_app::AppSink::builder().build();
-        build_preview_only_pipeline(&source(), &appsink).unwrap();
+        build_preview_only_pipeline(&mut source(), &appsink).unwrap();
     }
 }

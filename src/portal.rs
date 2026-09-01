@@ -107,8 +107,8 @@ impl Drop for PortalSession {
         // with an error here -- Drop can't return one, and a session
         // that's already gone (compositor restarted, etc.) isn't a bug in
         // this code.
-        let build = || -> zbus::Result<SessionProxy<'_>> { SessionProxy::builder(&self.connection).path(self.session_path.clone())?.build() };
-        if let Ok(proxy) = build() {
+        let proxy = SessionProxy::builder(&self.connection).path(self.session_path.clone()).and_then(|b| b.build());
+        if let Ok(proxy) = proxy {
             let _ = proxy.close();
         }
     }
@@ -180,10 +180,7 @@ pub fn negotiate(show_pointer: bool) -> Result<PortalSession> {
 
     // 1. CreateSession
     let results = call_and_wait(&connection, &unique_name, |token| {
-        let mut options: HashMap<&str, Value> = HashMap::new();
-        options.insert("handle_token", token.into());
-        options.insert("session_handle_token", token.into());
-        screencast.create_session(options)
+        screencast.create_session(HashMap::from([("handle_token", token.into()), ("session_handle_token", token.into())]))
     })
     .context("CreateSession failed")?;
     let session_handle: String = get_value(&results, "session_handle")?;
@@ -197,20 +194,19 @@ pub fn negotiate(show_pointer: bool) -> Result<PortalSession> {
     // picker offers both, matching X11Screen's --monitor/--window
     // coverage as closely as a portal-driven picker can.
     call_and_wait(&connection, &unique_name, |token| {
-        let mut options: HashMap<&str, Value> = HashMap::new();
-        options.insert("handle_token", token.into());
-        options.insert("types", (1u32 | 2u32).into());
-        options.insert("multiple", false.into());
-        options.insert("cursor_mode", (if show_pointer { 2u32 } else { 1u32 }).into());
+        let options = HashMap::from([
+            ("handle_token", token.into()),
+            ("types", (1u32 | 2u32).into()),
+            ("multiple", false.into()),
+            ("cursor_mode", (if show_pointer { 2u32 } else { 1u32 }).into()),
+        ]);
         screencast.select_sources(&session_path.as_ref(), options)
     })
     .context("SelectSources failed")?;
 
     // 3. Start
     let results = call_and_wait(&connection, &unique_name, |token| {
-        let mut options: HashMap<&str, Value> = HashMap::new();
-        options.insert("handle_token", token.into());
-        screencast.start(&session_path.as_ref(), "", options)
+        screencast.start(&session_path.as_ref(), "", HashMap::from([("handle_token", token.into())]))
     })
     .context("Start failed (did the picker dialog get cancelled?)")?;
 

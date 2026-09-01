@@ -1,5 +1,3 @@
-use std::cell::RefCell;
-
 use anyhow::{Context, Result};
 use gstreamer as gst;
 
@@ -61,19 +59,21 @@ pub struct Region {
 /// pre-select. See `portal.rs`'s `negotiate`.
 pub struct PortalConfig {
     pub show_pointer: bool,
-    /// Populated by `build_element` the first time it's called. `RefCell`
-    /// because `build_element` takes `&self`, but negotiation only
-    /// happens (and only can happen -- it blocks on the user interacting
-    /// with the picker dialog) once an element is actually being built.
-    /// See `PortalSession`'s doc comment for why keeping it alive exactly
-    /// as long as this config -- and therefore the `CaptureSource` it's
-    /// wrapped in -- is the right lifetime.
-    negotiated: RefCell<Option<PortalSession>>,
+    /// Populated by `build_element` the first time it's called (hence
+    /// `build_element` taking `&mut self` -- callers already own their
+    /// `CaptureSource` for the pipeline's whole lifetime, per the enum's
+    /// own doc comment, so a plain mutable borrow costs them nothing).
+    /// Negotiation only happens (and only can happen -- it blocks on the
+    /// user interacting with the picker dialog) once an element is
+    /// actually being built. See `PortalSession`'s doc comment for why
+    /// keeping it alive exactly as long as this config -- and therefore
+    /// the `CaptureSource` it's wrapped in -- is the right lifetime.
+    negotiated: Option<PortalSession>,
 }
 
 impl Default for PortalConfig {
     fn default() -> Self {
-        Self { show_pointer: true, negotiated: RefCell::new(None) }
+        Self { show_pointer: true, negotiated: None }
     }
 }
 
@@ -81,7 +81,10 @@ impl CaptureSource {
     /// Builds the actual GStreamer source element for this capture
     /// source. Callers only ever get back a `gst::Element` -- they never
     /// need to know it came from `ximagesrc`/`pipewiresrc` specifically.
-    pub fn build_element(&self) -> Result<gst::Element> {
+    /// Takes `&mut self` (not `&self`) because `Portal` needs to stash
+    /// its negotiated session somewhere for `self` to keep alive -- see
+    /// `PortalConfig::negotiated`.
+    pub fn build_element(&mut self) -> Result<gst::Element> {
         match self {
             CaptureSource::X11Screen(cfg) => build_ximagesrc(cfg),
             CaptureSource::Portal(cfg) => build_pipewiresrc(cfg),
@@ -115,7 +118,7 @@ fn build_ximagesrc(cfg: &X11ScreenConfig) -> Result<gst::Element> {
 
 /// Unlike `build_ximagesrc`, this one blocks: `portal::negotiate` waits on
 /// the compositor's own picker dialog and the user interacting with it.
-fn build_pipewiresrc(cfg: &PortalConfig) -> Result<gst::Element> {
+fn build_pipewiresrc(cfg: &mut PortalConfig) -> Result<gst::Element> {
     let session = portal::negotiate(cfg.show_pointer).context(
         "failed to negotiate screen capture via xdg-desktop-portal (is a portal backend with ScreenCast support running? a plain X11 session typically doesn't have one)",
     )?;
@@ -129,7 +132,7 @@ fn build_pipewiresrc(cfg: &PortalConfig) -> Result<gst::Element> {
     // See PortalSession's doc comment: this is what keeps the negotiated
     // fd (and the D-Bus session used to close it politely) alive for
     // exactly as long as this CaptureSource value is.
-    *cfg.negotiated.borrow_mut() = Some(session);
+    cfg.negotiated = Some(session);
 
     Ok(element)
 }

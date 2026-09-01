@@ -20,6 +20,14 @@ pub enum Command {
     Gui,
 }
 
+/// The CLI's own flag defaults -- also `config.rs`'s `Settings::default()`
+/// (the GUI's persisted-settings fallback for a brand-new install),
+/// defined once here rather than as a second hardcoded copy, so the two
+/// can't drift apart silently.
+pub const DEFAULT_FRAMERATE: u32 = 30;
+pub const DEFAULT_BITRATE_KBPS: u32 = 8000;
+pub const DEFAULT_SPEED_PRESET: &str = "veryfast";
+
 #[derive(Args, Debug)]
 pub struct RecordArgs {
     /// Output file path. Container is inferred from the extension
@@ -31,14 +39,14 @@ pub struct RecordArgs {
     #[arg(short, long)]
     pub duration: humantime::Duration,
 
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = DEFAULT_FRAMERATE)]
     pub framerate: u32,
 
     /// Target video bitrate in kbps.
-    #[arg(long, default_value_t = 8000)]
+    #[arg(long, default_value_t = DEFAULT_BITRATE_KBPS)]
     pub bitrate: u32,
 
-    #[arg(long, default_value = "veryfast")]
+    #[arg(long, default_value = DEFAULT_SPEED_PRESET)]
     pub speed_preset: String,
 
     /// Container format. Inferred from --output's extension if omitted.

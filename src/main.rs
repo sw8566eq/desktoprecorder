@@ -73,7 +73,7 @@ fn record_command(args: RecordArgs) -> Result<()> {
         anyhow::bail!("--monitor and --window can't be combined; pick one capture source");
     }
 
-    let source = if is_wayland() {
+    let mut source = if is_wayland() {
         // Portals don't expose monitor/window enumeration ahead of
         // picking, by design (privacy) -- the compositor draws its own
         // picker during Start instead, so there's nothing here to apply
@@ -113,7 +113,7 @@ fn record_command(args: RecordArgs) -> Result<()> {
         audio_device: args.audio_device.clone(),
     };
 
-    let pipeline = pipeline::build_recording_pipeline(&source, &cfg)?;
+    let pipeline = pipeline::build_recording_pipeline(&mut source, &cfg)?;
 
     let stop_requested = Arc::new(AtomicBool::new(false));
     {

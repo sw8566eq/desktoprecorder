@@ -230,15 +230,18 @@ fn build_ui(app: &adw::Application, active_stop: Arc<Mutex<Option<Arc<AtomicBool
          Not used with Mic + System, which always mixes the default mic with the default sink's monitor. Matches --audio-device on the CLI.",
     ));
 
+    // No initial set_value() here: apply_settings() (below, right after
+    // Gui is constructed) unconditionally sets both from config::load()
+    // -- which falls back to Settings::default() -- before the window is
+    // ever mapped, so a literal here would only ever be observed for a
+    // fraction of a frame before being overwritten.
     let framerate_spin = gtk4::SpinButton::with_range(1.0, 240.0, 1.0);
     framerate_spin.set_digits(0);
-    framerate_spin.set_value(30.0);
     framerate_spin.set_hexpand(true);
     framerate_spin.set_tooltip_text(Some("Frames per second to capture and encode. Matches --framerate on the CLI (default 30)."));
 
     let bitrate_spin = gtk4::SpinButton::with_range(500.0, 50_000.0, 100.0);
     bitrate_spin.set_digits(0);
-    bitrate_spin.set_value(8000.0);
     bitrate_spin.set_hexpand(true);
     bitrate_spin.set_tooltip_text(Some(
         "Target video bitrate in kbps -- higher means better quality at a larger file size. Matches --bitrate on the CLI (default 8000).",
@@ -416,8 +419,10 @@ fn build_ui(app: &adw::Application, active_stop: Arc<Mutex<Option<Arc<AtomicBool
 /// affects the open popup's rows; the closed button's own display
 /// (built from `from_strings`'s default factory) is left untouched.
 fn build_preset_dropdown() -> gtk4::DropDown {
+    // No initial set_selected() here: its one call site (build_ui) always
+    // follows up with apply_settings(&config::load(), ...), which sets it
+    // for real -- same reasoning as framerate_spin/bitrate_spin above.
     let preset_dd = gtk4::DropDown::from_strings(&PRESETS);
-    preset_dd.set_selected(DEFAULT_PRESET_INDEX);
     preset_dd.set_hexpand(true);
 
     let factory = gtk4::SignalListItemFactory::new();
@@ -514,11 +519,11 @@ fn build_capture_source(choice: SourceChoice) -> CaptureSource {
 /// ever call this outside of a recording; during one, the recording
 /// pipeline's own tee'd branch is what feeds the preview instead.
 fn start_standalone_preview(gui: &mut Gui) {
-    let source = build_capture_source(selected_source_choice(gui));
+    let mut source = build_capture_source(selected_source_choice(gui));
     let (appsink, latest) = build_preview_sink();
 
     let built: anyhow::Result<gst::Pipeline> = (|| {
-        let pipeline = pipeline::build_preview_only_pipeline(&source, &appsink)?;
+        let pipeline = pipeline::build_preview_only_pipeline(&mut source, &appsink)?;
         pipeline.set_state(gst::State::Playing).context("failed to start preview pipeline")?;
         Ok(pipeline)
     })();
@@ -687,7 +692,7 @@ fn show_frame(picture: &gtk4::Picture, frame: LatestFrame) {
 /// Reads the form, validates it, and (if valid) spawns the background
 /// recording thread and starts the UI tick that watches it.
 fn start_recording(state: &Rc<RefCell<Gui>>) {
-    let (source, cfg, duration, indefinite) = {
+    let (mut source, cfg, duration, indefinite) = {
         let gui = state.borrow();
 
         let output_text = gui.output_entry.text();
@@ -776,7 +781,7 @@ fn start_recording(state: &Rc<RefCell<Gui>>) {
 
     std::thread::spawn(move || {
         let result: anyhow::Result<bool> = (|| {
-            let pipeline = pipeline::build_recording_pipeline_with_preview(&source, &cfg, &preview_sink)?;
+            let pipeline = pipeline::build_recording_pipeline_with_preview(&mut source, &cfg, &preview_sink)?;
             record::run_recording(&pipeline, duration, &stop_for_thread)?;
             Ok(stop_for_thread.load(Ordering::SeqCst)) // did Stop get clicked?
         })();
@@ -954,8 +959,10 @@ mod tests {
         // preset without touching the other array.
         assert_eq!(PRESETS.len(), PRESET_DESCRIPTIONS.len());
         assert!((DEFAULT_PRESET_INDEX as usize) < PRESETS.len());
-        // Matches the CLI's own default (cli.rs's --speed-preset).
-        assert_eq!(PRESETS[DEFAULT_PRESET_INDEX as usize], "veryfast");
+        // Matches the CLI's own default (cli.rs's --speed-preset), which
+        // config.rs's Settings::default() also reuses directly -- this is
+        // the one hardcoded link between this array and that constant.
+        assert_eq!(PRESETS[DEFAULT_PRESET_INDEX as usize], crate::cli::DEFAULT_SPEED_PRESET);
     }
 
     #[test]
